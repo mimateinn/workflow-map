@@ -9,7 +9,7 @@ import { detectLang, HELP_TABS, LANGS, looksLikeRequest, resolveLang, STR } from
 import type { Lang } from './i18n'
 import { CAPSULE_CELLS, CAPSULE_CHROME, cells, fitCells, forkPrompt, languageRule, MAX_SUGGESTIONS, MIN_ANSWER_CHARS, parseSuggestions, planSuggestions, ROW_CHROME, sameAs, skillList } from './suggest'
 import type { Suggestion, SuggestView } from './suggest'
-import { amberPic, bandGraph, bandHeader, detailLines, fmtTime, iconPic, miniBar, paneBar, paneCards, paneStatus, PX_PER_COL, slotPic, STAR_W, starPic, THEMES } from './svg'
+import { amberPic, bandGraph, bandHeader, chevronPic, detailLines, fmtTime, iconPic, miniBar, paneBar, paneCards, paneStatus, PX_PER_COL, slotPic, STAR_W, starPic, THEMES } from './svg'
 import type { Clock, Kind } from './svg'
 
 const TOOL = 'mcp__workflow-map__workflow_map'
@@ -45,17 +45,27 @@ const CARD_FILL = { dark: '#ffffff0f', light: '#0000000d' } as const
 const CARD_EDGE = '#00000000'
 const GLYPH_COLLAPSE = '˄'
 const GLYPH_OPEN = '⤢'
+/**
+ * 計劃按 session 分開：每個計劃一個檔（PLANS_DIR/<planId>.json），每個 session 最多綁一個計劃（綁定存在 $.store，
+ * key = bind:<sessionId>）。舊的共用檔 FILE 當作 id 為 'default' 的計劃，原地讀寫、不搬不改名不轉換；
+ * 只有綁了它的 session 才看見它。
+ */
 const FILE = '.claude/workflow-map.json'
+const LEGACY_ID = 'default'
+const PLANS_DIR = '.claude/workflow-map/plans'
+const UNDO_DIR = '.claude/workflow-map/undo'
+const bindKey = (sessionId: string) => `bind:${sessionId}`
+type Binding = { root: string; planId: string; at: string }
 /** 封存的計劃：一個計劃一個檔，主檔保持細小 */
 const HISTORY_DIR = '.claude/workflow-map.history'
 /** 匯出的 Markdown（只寫這一個檔） */
 const EXPORT_FILE = '.claude/workflow-map.export.md'
-/** 還原用的快照（最近 UNDO_MAX 次寫入之前的計劃），記憶體 + 檔案各一份 */
-const UNDO_FILE = '.claude/workflow-map.undo.json'
+/** 還原用的快照（每個計劃最近 UNDO_MAX 次寫入之前的樣子），記憶體 + 檔案（UNDO_DIR/<planId>.json）各一份 */
 const UNDO_MAX = 10
 type Snapshot = { at: string; label: string; map: WorkflowMap }
 let undoStack: Snapshot[] = []
-let undoLoaded = false
+/** undoStack 屬於哪個計劃（'' = 未讀） */
+let undoFor = ''
 
 const MAP = atom({ plugin: 'workflow-map', key: 'map' } as const, emptyMap())
 const EXPANDED = atom({ plugin: 'workflow-map', key: 'expanded' } as const, false)
@@ -68,15 +78,23 @@ const FUTURE_OPEN = atom({ plugin: 'workflow-map', key: 'futureOpen' } as const,
 const HISTORY_OPEN = atom({ plugin: 'workflow-map', key: 'historyOpen' } as const, false)
 /** 全圖面板展開詳情的步驟（一次只開一個；'' = 無） */
 const SELECTED = atom({ plugin: 'workflow-map', key: 'selected' } as const, '')
+/** 輸入框上方的卡片圖：是否顯示全部步驟（含稍後的層） */
+const BAND_ALL = atom({ plugin: 'workflow-map', key: 'bandAll' } as const, false)
+/** 卡片圖全部顯示時最多幾行卡 */
+const BAND_MAX_ROWS = 6
 /** 全圖面板最上面的說明卡是否打開 */
 const HELP_OPEN = atom({ plugin: 'workflow-map', key: 'helpOpen' } as const, false)
 /** 全圖面板：專案總覽、正在唯讀檢視的另一個專案 */
 const PROJECTS_OPEN = atom({ plugin: 'workflow-map', key: 'projectsOpen' } as const, false)
+/** 這個 session 綁定的計劃 id（'' = 未綁定：橫條不畫計劃） */
+const BOUND = atom({ plugin: 'workflow-map', key: 'bound' } as const, '')
+/** 全圖面板「計劃」清單是否展開 */
+const PLANS_OPEN = atom({ plugin: 'workflow-map', key: 'plansOpen' } as const, false)
 const VIEW_ROOT = atom({ plugin: 'workflow-map', key: 'viewRoot' } as const, '')
 /** $.store：有計劃的專案（最近 PROJECTS_MAX 個）。只讀別的專案的檔，從不寫。 */
 const PROJECTS_KEY = 'projectsV1'
 const PROJECTS_MAX = 20
-type ProjectEntry = { root: string; title: string; done: number; total: number; running: number; updatedAt: string }
+type ProjectEntry = { root: string; title: string; done: number; total: number; running: number; updatedAt: string; planId?: string }
 
 /** 說明卡顯示哪一種語言（'' = 介面語言） */
 const HELP_LANG = atom({ plugin: 'workflow-map', key: 'helpLang' } as const, '')
@@ -102,7 +120,7 @@ const WORDING =
   'titles at most 8 CJK characters or 20 Latin characters; notes at most 20 CJK or 60 Latin characters.'
 
 const DESCRIPTION =
-  'Live dependency graph of the current work, shown to the user and saved to .claude/workflow-map.json. ' +
+  "Live dependency graph of this session's work (each session has its own plan; files under .claude/workflow-map/plans/), shown to the user. " +
   'ops: new_plan {title,nodes} starts an unrelated task (the current plan is archived to history); ' +
   "set_plan {nodes} replaces this plan's steps; upsert {nodes} changes only the given fields; status {id,status,note?}; " +
   'insert {nodes,note,before?} records work the USER interjected mid-plan (note = their words; deps = what it waits for; ' +
@@ -110,12 +128,14 @@ const DESCRIPTION =
   'Node: {id, title, status: todo|doing|done|blocked|dropped, deps: [ids it waits for], owner?, note?}. ' +
   'Steps sharing no deps path run in parallel. Cycles and unknown deps are rejected. ' +
   'Other ops return a one-line summary plus the changed steps and their neighbours. ' +
+  'join {plan} binds this session to an existing plan of the project (to share it); leave unbinds. ' +
   WORDING
 
 const SCHEMA = {
   type: 'object',
   properties: {
-    op: { type: 'string', enum: ['new_plan', 'set_plan', 'upsert', 'status', 'insert', 'remove', 'show'] },
+    op: { type: 'string', enum: ['new_plan', 'set_plan', 'upsert', 'status', 'insert', 'remove', 'show', 'join', 'leave'] },
+    plan: { type: 'string', description: 'join: the id or title of an existing plan of this project' },
     title: { type: 'string', description: 'new_plan: a short name for the task, in the user\'s language' },
     nodes: {
       type: 'array',
@@ -144,8 +164,8 @@ const SCHEMA = {
 
 // 每次對話都會帶上：保持 ≤ ~80 字
 const GUIDE =
-  `# Workflow map\nFor work with 3+ steps, keep the map current with ${TOOL}: set_plan at the start (honest deps: independent steps share none), ` +
-  'status doing/done as you go; new_plan when the user starts an unrelated task. ' +
+  `# Workflow map\nThe map is this session's own plan. For work with 3+ steps keep it current with ${TOOL}: new_plan at the start ` +
+  '(honest deps: independent steps share none), status doing/done as you go, new_plan again for an unrelated task. ' +
   'If the user asks for something not in the plan, first insert it (note = their words; before = steps that must wait), then act. ' +
   'When delegating a step, set its owner and put [wm:<id>] in the Agent description; the step then syncs with that agent. ' +
   "Titles: the user's language, ≤ 8 CJK / 20 Latin characters, plain words."
@@ -235,8 +255,16 @@ async function demoMap($: $): Promise<WorkflowMap> {
 }
 const shownMap = async ($: $) => ((await read($, DEMO)) ? demoMap($) : read($, MAP))
 
-async function filePath($: $): Promise<string> {
-  return `${(await $.session.root()).replace(/[\\/]+$/, '')}/${FILE}`
+const sessionIdOf = async ($: $) => {
+  try {
+    return await $.session.id()
+  } catch {
+    return ''
+  }
+}
+
+async function planPathOf($: $, planId: string): Promise<string> {
+  return `${(await $.session.root()).replace(/[\\/]+$/, '')}/${planId === LEGACY_ID ? FILE : `${PLANS_DIR}/${planId}.json`}`
 }
 
 const nowIso = async ($: $) => new Date(await $.clock.now()).toISOString()
@@ -259,15 +287,15 @@ async function registerProject($: $, map: WorkflowMap) {
   const s = stats(map)
   const others = (await readProjects($)).filter(p => p.root !== root)
   const mine: ProjectEntry[] = map.nodes.length
-    ? [{ root, title: map.title ?? '', done: s.done, total: s.total, running: s.doing.length, updatedAt: map.updatedAt }]
+    ? [{ root, title: map.title ?? '', done: s.done, total: s.total, running: s.doing.length, updatedAt: map.updatedAt, planId: await read($, BOUND) }]
     : []
   await $.store.set(PROJECTS_KEY, [...mine, ...others].slice(0, PROJECTS_MAX))
 }
 
 /** 唯讀讀取另一個專案的計劃（任何錯誤 → undefined；從不寫入）。 */
-async function readForeign($: $, root: string): Promise<WorkflowMap | undefined> {
+async function readForeign($: $, root: string, planId = LEGACY_ID): Promise<WorkflowMap | undefined> {
   try {
-    const v = validateMap(JSON.parse(await $.fs.read(`${root}/${FILE}`)))
+    const v = validateMap(JSON.parse(await $.fs.read(`${root}/${planId === LEGACY_ID ? FILE : `${PLANS_DIR}/${planId}.json`}`)))
     return typeof v === 'string' ? undefined : migrate(v, await nowIso($)).map
   } catch {
     return undefined
@@ -275,21 +303,24 @@ async function readForeign($: $, root: string): Promise<WorkflowMap | undefined>
 }
 
 /**
- * 從檔案讀取（單一真相）。無檔 → 空圖。損壞 → 原文備份為 .bad-<ts>.json、寫入空圖、提示一次。
- * 讀取失敗（IO 錯誤）則拋出，不覆寫檔案。
+ * 讀一個計劃（預設：這個 session 綁定的）。未綁定 → 空圖。無檔 → 空圖（id = 該計劃）。
+ * 舊格式：計劃檔先備份原文再寫入新格式；舊共用檔（default）只在記憶體轉換，不改檔。
+ * 損壞：計劃檔備份為 .bad-<ts>.json 再重來；舊共用檔不覆寫，拋出錯誤。讀取失敗（IO）拋出。
  */
-export async function loadMap($: $): Promise<WorkflowMap> {
-  const path = await filePath($)
-  if (!(await $.fs.exists(path))) return emptyMap(await nowIso($))
+export async function loadMap($: $, planId?: string): Promise<WorkflowMap> {
+  const id = planId ?? (await read($, BOUND))
+  if (!id) return emptyMap(await nowIso($))
+  const legacy = id === LEGACY_ID
+  const path = await planPathOf($, id)
+  if (!(await $.fs.exists(path))) return { ...emptyMap(await nowIso($)), ...(legacy ? {} : { planId: id }) }
   const text = await $.fs.read(path)
   let problem: string
   const stamp = (await nowIso($)).replace(/[:.]/g, '-')
   try {
     const v = validateMap(JSON.parse(text))
     if (typeof v !== 'string') {
-      // 舊格式：先把原文備份，再寫入新格式（只加欄位，不刪資料）
       const m = migrate(v, await nowIso($))
-      if (m.map === v) return v
+      if (m.map === v || legacy) return m.map
       await $.fs.write(path.replace(/\.json$/, `.v${m.from}-backup-${stamp}.json`), text)
       await $.fs.write(path, `${JSON.stringify(m.map, null, 2)}\n`)
       return m.map
@@ -298,12 +329,94 @@ export async function loadMap($: $): Promise<WorkflowMap> {
   } catch {
     problem = 'invalid JSON'
   }
+  if (legacy) throw new Error(`${FILE} cannot be read (${problem}); it was left untouched`)
   const backup = path.replace(/\.json$/, `.bad-${stamp}.json`)
   await $.fs.write(backup, text)
-  const empty = emptyMap()
+  const empty = { ...emptyMap(await nowIso($)), planId: id }
   await $.fs.write(path, `${JSON.stringify(empty, null, 2)}\n`)
   $.ui.toast(STR[await langNow($)].corrupt(problem, backup.split('/').pop() ?? backup))
   return empty
+}
+
+/** 這個專案裏綁了某計劃的 session（由 $.store 的綁定得知）。 */
+async function sessionsOn($: $, planId: string): Promise<string[]> {
+  const root = await rootOf($)
+  const out: string[] = []
+  for (const key of await $.store.keys().catch(() => [] as string[])) {
+    if (!key.startsWith('bind:')) continue
+    const b = (await $.store.get(key).catch(() => undefined)) as Binding | undefined
+    if (b && b.root === root && b.planId === planId) out.push(key.slice(5))
+  }
+  return out
+}
+
+/** 計劃檔記下哪些 session 在用（給其他工具看；舊共用檔不寫）。 */
+async function recordSessions($: $, planId: string) {
+  if (!planId || planId === LEGACY_ID) return
+  const path = await planPathOf($, planId)
+  if (!(await $.fs.exists(path))) return
+  const map = await loadMap($, planId)
+  await $.fs.write(path, `${JSON.stringify({ ...map, sessions: await sessionsOn($, planId) }, null, 2)}\n`)
+}
+
+/** 綁定（或解除綁定：planId = ''）這個 session 的計劃，並載入它。 */
+async function bindPlan($: $, planId: string) {
+  const sid = await sessionIdOf($)
+  const prev = await read($, BOUND)
+  await update($, BOUND, () => planId)
+  if (planId) await $.store.set(bindKey(sid), { root: await rootOf($), planId, at: await nowIso($) } satisfies Binding)
+  else await $.store.delete(bindKey(sid)).catch(() => undefined)
+  undoFor = ''
+  undoStack = []
+  const map = await loadMap($, planId).catch(() => emptyMap())
+  await update($, MAP, () => map)
+  await foldAll($)
+  if (prev && prev !== planId) await recordSessions($, prev).catch(() => undefined)
+  await recordSessions($, planId).catch(() => undefined)
+  if (planId) await registerProject($, map).catch(() => undefined)
+}
+
+type PlanInfo = { id: string; title: string; done: number; total: number; running: number; updatedAt: string; sessions: string[] }
+
+/** 這個專案的全部計劃（舊共用檔 + 計劃資料夾；已封存的不列）。 */
+async function listPlans($: $): Promise<PlanInfo[]> {
+  const root = await rootOf($)
+  const ids: string[] = []
+  if (await $.fs.exists(`${root}/${FILE}`)) ids.push(LEGACY_ID)
+  for (const f of await $.fs.list(`${root}/${PLANS_DIR}`).catch(() => [])) if (f.kind === 'file' && f.name.endsWith('.json') && !f.name.includes('.bad-') && !f.name.includes('-backup-')) ids.push(f.name.slice(0, -5))
+  const out: PlanInfo[] = []
+  for (const id of ids) {
+    try {
+      const m = validateMap(JSON.parse(await $.fs.read(await planPathOf($, id))))
+      if (typeof m === 'string' || m.archivedAt || m.nodes.length === 0) continue
+      const st = stats(m)
+      out.push({ id, title: m.title || m.nodes[0]?.title || '', done: st.done, total: st.total, running: st.doing.length, updatedAt: m.updatedAt, sessions: await sessionsOn($, id) })
+    } catch {
+      // 讀不到：略過
+    }
+  }
+  return out.sort((x, y) => y.updatedAt.localeCompare(x.updatedAt))
+}
+
+/** 未綁定時工具的回覆：說明要怎樣做，並列出可加入的計劃。 */
+async function noPlanMessage($: $): Promise<string> {
+  const plans = await listPlans($)
+  const list = plans.map(p => `"${p.id}" (${p.title || 'untitled'}, ${p.done}/${p.total}${p.sessions.length ? `, ${p.sessions.length} session(s)` : ''})`).join('; ')
+  return (
+    'No workflow plan is bound to this session (each session has its own plan). Call new_plan {title, nodes} to start one' +
+    (list ? `, or op join {plan} to continue an existing plan of this project: ${list}.` : '.')
+  )
+}
+
+/** 加入（綁定）一個計劃：plan = id，或標題（完全相同優先，其次包含）。 */
+async function joinPlan($: $, ref: string): Promise<string> {
+  const plans = await listPlans($)
+  const q = ref.trim().toLowerCase()
+  const hit = plans.find(p => p.id.toLowerCase() === q) ?? plans.find(p => p.title.toLowerCase() === q) ?? plans.find(p => q && p.title.toLowerCase().includes(q))
+  const t = STR[await langNow($)]
+  if (!hit) return t.planNotFound(ref)
+  await bindPlan($, hit.id)
+  return t.joined(hit.title || hit.id)
 }
 
 const openPane = ($: $, lang: Lang) => $.ui.open({ id: PANE, title: STR[lang].paneTitle })
@@ -319,17 +432,21 @@ export const register: Register = (on, options) => {
     await $.tool.register({ name: 'workflow_map', description: DESCRIPTION, inputSchema: SCHEMA, isDeferred: false })
     await refreshTheme($)
     // 還原快照：新 session 由檔案重新讀
-    undoLoaded = false
+    undoFor = ''
     undoStack = []
     const expanded = (await $.store.get('expanded')) === true
     await update($, EXPANDED, () => expanded)
     const storedLang = await $.store.get(LANG_KEY)
     if (typeof storedLang === 'string') await update($, LANG, () => storedLang)
+    // 這個 session 綁定的計劃（重新載入外掛或繼續同一個 session 時保留；新 session 未綁定）
+    const binding = (await $.store.get(bindKey(await sessionIdOf($))).catch(() => undefined)) as Binding | undefined
+    const planId = binding && binding.root === (await rootOf($)) && typeof binding.planId === 'string' ? binding.planId : ''
+    await update($, BOUND, () => planId)
     let map = emptyMap()
     try {
       map = await loadMap($)
       await update($, MAP, () => map)
-      await registerProject($, map).catch(() => undefined)
+      if (planId) await registerProject($, map).catch(() => undefined)
     } catch (err) {
       $.ui.toast(STR[await langNow($)].readFail(String(err).slice(0, 200)))
     }
@@ -350,7 +467,9 @@ export const register: Register = (on, options) => {
           if (isStale(n, nowMs, staleMinutes)) notifyOnce($, `${n.id}:stale:${n.updatedAt ?? n.startedAt ?? ''}`, t.nStale(n.title, staleMinutes))
       }
       try {
-        const path = await filePath($)
+        const bound = await read($, BOUND)
+        if (!bound) return
+        const path = await planPathOf($, bound)
         const st = await $.fs.stat(path)
         if (st.mtimeMs === lastMtime) return
         lastMtime = st.mtimeMs
@@ -485,6 +604,19 @@ export const register: Register = (on, options) => {
     const arg = String((e as { args?: unknown }).args ?? '').trim().toLowerCase()
     // /workflow export：寫 Markdown 檔並複製
     if (arg === 'export') return { text: await exportPlan($) }
+    // /workflow join <id|標題>、/workflow leave
+    const rawArg = String((e as { args?: unknown }).args ?? '').trim()
+    if (/^join\s+/i.test(rawArg)) {
+      const msg = await joinPlan($, rawArg.replace(/^join\s+/i, ''))
+      $.ui.toast(msg)
+      return { text: msg }
+    }
+    if (arg === 'leave') {
+      await bindPlan($, '')
+      const msg = STR[lang].left
+      $.ui.toast(msg)
+      return { text: msg }
+    }
     // /workflow undo：還原上一次寫入
     if (arg === 'undo') {
       const msg = await undoPlan($)
@@ -601,7 +733,36 @@ export const register: Register = (on, options) => {
       const clock = await clockOf($)
       const etaM = etaMin(map, clock.now)
       const head = bandHeader(map, view, lang, T, avail, pending, clock, etaM === undefined ? '' : `≈ ${t.durShort(etaM)}`)
-      const graph = expanded ? bandGraph(map, view, lang, T, avail + 56, clock) : undefined
+      const showAll = await read($, BAND_ALL)
+      const graph = expanded
+        ? bandGraph(map, showAll ? stageView(map, { freshSince: await read($, TURN_AT), expandFuture: true }) : view, lang, T, avail - 80, clock, {
+            all: showAll,
+            maxRows: BAND_MAX_ROWS,
+          })
+        : undefined
+      // 「+N 稍後」：圖後的 app 文字按鈕（圖裏的字按不到）；全部顯示時是「收起稍後」，再多的仍有「+N … 全圖」
+      const chips = graph
+        ? [
+            ...(showAll ? [<Button key="band-less" {...ICON_BTN} label={t.hideLater} onPress={() => update($, BAND_ALL, () => false)} />] : []),
+            ...(graph.hidden > 0
+              ? [
+                  showAll ? (
+                    <Button
+                      key="band-more"
+                      {...ICON_BTN}
+                      label={t.moreInFull(graph.hidden)}
+                      onPress={async () => {
+                        await update($, FUTURE_OPEN, () => true)
+                        await openPane($, lang)
+                      }}
+                    />
+                  ) : (
+                    <Button key="band-later" {...ICON_BTN} label={t.laterCard(graph.hidden)} onPress={() => update($, BAND_ALL, () => true)} />
+                  ),
+                ]
+              : []),
+          ]
+        : []
       const s = stats(map)
       planRows = [
         <Box key="title" flexDirection="row" alignItems="center" gap={SPACE.GAP}>
@@ -621,8 +782,9 @@ export const register: Register = (on, options) => {
           {controls}
         </Box>,
         graph ? (
-          <Box key="graph">
+          <Box key="graph" flexDirection="row" alignItems="flex-start" gap={SPACE.GAP}>
             <Svg source={graph.source} alt={plainLines(map, lang).join('\n')} width={graph.width} height={graph.height} />
+            {chips}
           </Box>
         ) : null,
       ]
@@ -650,7 +812,8 @@ export const register: Register = (on, options) => {
     const viewRoot = await read($, VIEW_ROOT)
     const ownRoot = await rootOf($)
     const foreign = viewRoot !== '' && viewRoot !== ownRoot ? viewRoot : undefined
-    const foreignMap = foreign ? await readForeign($, foreign) : undefined
+    const foreignEntry = foreign ? (await readProjects($)).find(p => p.root === foreign) : undefined
+    const foreignMap = foreign ? await readForeign($, foreign, foreignEntry?.planId || LEGACY_ID) : undefined
     const map = foreign ? (foreignMap ?? emptyMap()) : await shownMap($)
     const projectName = (root: string) => root.split(/[\\/]/).filter(Boolean).pop() ?? root
     const backButton = <Button key="project-back" {...ICON_BTN} label={`← ${t.back}`} onPress={() => update($, VIEW_ROOT, () => '')} />
@@ -668,7 +831,18 @@ export const register: Register = (on, options) => {
         </Box>
       )
     const projectsOpen = await read($, PROJECTS_OPEN)
-    if (map.nodes.length === 0 && !projectsOpen) return <Text dimColor>{t.empty}</Text>
+    const plansOpen = await read($, PLANS_OPEN)
+    if (map.nodes.length === 0 && !projectsOpen && !plansOpen) {
+      // 未綁定計劃：說明 + 打開「計劃」清單可以加入本專案的計劃
+      return (
+        <Box flexDirection="column" paddingLeft={PANE_INSET} gap={SPACE.GAP}>
+          <Text dimColor>{(await read($, BOUND)) ? t.empty : t.noPlanBound}</Text>
+          <Box flexDirection="row">
+            <Button key="plans" {...ICON_BTN} label={t.plans} onPress={() => update($, PLANS_OPEN, () => true)} />
+          </Box>
+        </Box>
+      )
+    }
     const doneOpen = await read($, DONE_OPEN)
     const futureOpen = await read($, FUTURE_OPEN)
     const turnAt = await read($, TURN_AT)
@@ -691,8 +865,12 @@ export const register: Register = (on, options) => {
             { key: 'export', label: t.exportBtn, onPress: async (press: UiPressArgument) => $.ui.toast(await exportPlan($, press.surface)) },
             { key: 'history', label: historyOpen ? t.hideHistory : t.history, onPress: () => update($, HISTORY_OPEN, v => !v) },
           ]),
+      ...(foreign ? [] : [{ key: 'plans', label: plansOpen ? t.hidePlans : t.plans, onPress: () => update($, PLANS_OPEN, v => !v) }]),
       { key: 'projects', label: projectsOpen ? t.hideProjects : t.projects, onPress: () => update($, PROJECTS_OPEN, v => !v) },
     ]
+    const plans = plansOpen && !foreign ? await listPlans($) : []
+    const mySession = await sessionIdOf($)
+    const myPlan = await read($, BOUND)
     const projects = projectsOpen ? await readProjects($) : []
     const helpOpen = await read($, HELP_OPEN)
     // 說明卡的語言：分頁選的，否則介面語言
@@ -799,16 +977,15 @@ export const register: Register = (on, options) => {
     const stageCards = cards.filter(c => c.key.startsWith('stage:'))
     const nowCount = base.levels.length
     const doneCard = cards.find(c => c.key === 'done')
-    const chevron = (open: boolean) => (open ? '⌃' : '⌄')
-    const sections: { key: string; label: string; toggle?: { key: string; onPress: () => unknown }; cards: typeof cards }[] = [
+    const sections: { key: string; label: string; toggle?: { key: string; open: boolean; onPress: () => unknown }; cards: typeof cards }[] = [
       ...(stageCards.length ? [{ key: 'now', label: t.secNow, cards: stageCards.slice(0, 1) }] : []),
       ...(nowCount > 1 ? [{ key: 'next', label: t.secNext, cards: stageCards.slice(1, nowCount) }] : []),
       ...(view.done.length
         ? [
             {
               key: 'done',
-              label: `${t.secDone} ${view.done.length} ${chevron(doneShown)}`,
-              toggle: { key: 'fold-done', onPress: () => update($, DONE_OPEN, () => !doneShown) },
+              label: `${t.secDone} ${view.done.length}`,
+              toggle: { key: 'fold-done', open: doneShown, onPress: () => update($, DONE_OPEN, () => !doneShown) },
               cards: doneShown && doneCard ? [doneCard] : [],
             },
           ]
@@ -817,8 +994,8 @@ export const register: Register = (on, options) => {
         ? [
             {
               key: 'later',
-              label: `${t.secLater} ${base.later.length} ${chevron(futureOpen)}`,
-              toggle: { key: 'fold-future', onPress: () => update($, FUTURE_OPEN, v => !v) },
+              label: `${t.secLater} ${base.later.length}`,
+              toggle: { key: 'fold-future', open: futureOpen, onPress: () => update($, FUTURE_OPEN, v => !v) },
               cards: futureOpen ? stageCards.slice(nowCount) : [],
             },
           ]
@@ -835,7 +1012,6 @@ export const register: Register = (on, options) => {
     const Select = e.surface !== 'terminal' && 'Select' in table ? table.Select : undefined
     // Select 沒有闊度屬性：包一個不會被壓的格，闊 = 最長的選項（CJK 算 2 格）+ 展開記號與內距
     const selectW = Math.max(...HELP_TABS.map(([, name]) => cells(name))) + 6
-    const langInline = cols >= selectW + 46
     const helpLangPicker = Select ? (
       <Select
         key="help-lang"
@@ -898,20 +1074,22 @@ export const register: Register = (on, options) => {
         </Box>
         {helpOpen
           ? card('help', [
-              // 第一行：簡介（左，可換行）＋ 語言選單、收起（右，像設定頁的控制）；太窄時語言選單移到下一行，不截斷
-              <Box key="intro" flexDirection="row" alignItems="center" gap={SPACE.GAP}>
-                <Box flexGrow={1} flexShrink={1}>
-                  <Text wrap="wrap">{hs.helpWhat}</Text>
-                </Box>
-                {Select && langInline ? langBox : null}
+              // 第一行像設定頁的一列：「語言」（左，淡色）…… 下拉選單、收起（右），同一行、垂直置中；選單不會被擠到下一行
+              <Box key="lang-row" flexDirection="row" alignItems="center" gap={SPACE.GAP}>
+                <Text dimColor>{hs.languageLabel}</Text>
+                <Box flexGrow={1} />
+                {Select ? langBox : null}
                 {btn('help-close', hs.helpClose, () => update($, HELP_OPEN, () => false))}
               </Box>,
-              Select && !langInline ? (
-                <Box key="lang-row" flexDirection="row">
-                  <Box flexGrow={1} />
-                  {langBox}
+              Select ? null : (
+                <Box key="tabs" flexDirection="row" flexWrap="wrap" gap={SPACE.GAP}>
+                  {helpLangPicker}
                 </Box>
-              ) : null,
+              ),
+              divider('help-div-0'),
+              <Box key="intro">
+                <Text wrap="wrap">{hs.helpWhat}</Text>
+              </Box>,
               Select ? null : (
                 <Box key="tabs" flexDirection="row" flexWrap="wrap" gap={SPACE.GAP}>
                   {helpLangPicker}
@@ -952,6 +1130,8 @@ export const register: Register = (on, options) => {
                   ['/workflow-demo', hs.helpCmds.demo],
                   ['/workflow export', hs.helpCmds.export],
                   ['/workflow undo', hs.helpCmds.undo],
+                  ['/workflow join', hs.helpCmds.join],
+                  ['/workflow leave', hs.helpCmds.leave],
                   ['language', hs.helpCmds.language],
                   ['staleMinutes', hs.helpCmds.staleMinutes],
                   ['suggestions', hs.helpCmds.suggestions],
@@ -972,11 +1152,45 @@ export const register: Register = (on, options) => {
             ])
           : null}
         {sections.map(sec => [
-          <Box key={`sec:${sec.key}`} marginTop={SPACE.GAP} flexDirection="row">
-            {sec.toggle ? btn(sec.toggle.key, sec.label, sec.toggle.onPress) : <Text dimColor>{sec.label}</Text>}
+          <Box key={`sec:${sec.key}`} marginTop={SPACE.GAP} flexDirection="row" alignItems="center">
+            {sec.toggle ? btn(sec.toggle.key, Svg ? sec.label : `${sec.label} ${sec.toggle.open ? '⌃' : '⌄'}`, sec.toggle.onPress) : <Text dimColor>{sec.label}</Text>}
+            {sec.toggle && Svg ? <Svg source={chevronPic(sec.toggle.open, T).source} alt={sec.toggle.open ? t.collapseTip : t.expandTip} width={14} height={20} /> : null}
           </Box>,
           ...sec.cards.map(c => stageCard(c, sec.key === 'done')),
         ])}
+        {plansOpen && !foreign
+          ? card('plans', [
+              line('head', iconCol(undefined, false, ''), <Text bold>{t.plans}</Text>),
+              plans.length === 0 ? line('empty', iconCol(undefined, false, ''), <Text dimColor>{t.noPlansHere}</Text>) : null,
+              ...plans.flatMap((p, i) => [
+                i > 0 ? divider(`plan-div-${i}`) : null,
+                line(
+                  `pl-${p.id}`,
+                  iconCol(p.total > 0 && p.done === p.total ? 'done' : p.running > 0 ? 'doing' : 'todo', false, ''),
+                  <Box flexShrink={1}>
+                    <Text wrap="truncate-end">{p.title || t.untitled}</Text>
+                  </Box>,
+                  <Box flexGrow={1} />,
+                  <Text dimColor>
+                    {[
+                      `${p.done}/${p.total}`,
+                      p.id === myPlan ? t.thisSession : '',
+                      t.sessionsN(p.sessions.filter(x => x !== mySession).length),
+                      fmtTime(p.updatedAt),
+                    ]
+                      .filter(Boolean)
+                      .join(' · ')}
+                  </Text>,
+                  p.id === myPlan
+                    ? btn(`leave-${p.id}`, t.leave, async () => {
+                        await bindPlan($, '')
+                        $.ui.toast(t.left)
+                      })
+                    : btn(`join-${p.id}`, myPlan ? t.switchTo : t.join, async () => $.ui.toast(await joinPlan($, p.id))),
+                ),
+              ]),
+            ])
+          : null}
         {projectsOpen
           ? card('projects', [
               line('head', iconCol(undefined, false, ''), <Text bold>{t.projects}</Text>),
@@ -1054,14 +1268,14 @@ async function exportPlan($: $, surface?: UiPressArgument['surface']): Promise<s
   return STR[lang].exported(EXPORT_FILE)
 }
 
-const undoPath = async ($: $) => `${(await $.session.root()).replace(/[\\/]+$/, '')}/${UNDO_FILE}`
+const undoPath = async ($: $, planId: string) => `${(await $.session.root()).replace(/[\\/]+$/, '')}/${UNDO_DIR}/${planId}.json`
 
-/** 第一次用到時由檔案讀回快照（壞檔當作空）。 */
-async function loadUndo($: $) {
-  if (undoLoaded) return
-  undoLoaded = true
+/** 這個計劃的快照：第一次用到時由檔案讀回（壞檔當作空）。 */
+async function loadUndo($: $, planId: string) {
+  if (undoFor === planId) return
+  undoFor = planId
   try {
-    const raw = JSON.parse(await $.fs.read(await undoPath($))) as { snapshots?: unknown }
+    const raw = JSON.parse(await $.fs.read(await undoPath($, planId))) as { snapshots?: unknown }
     const list = Array.isArray(raw.snapshots) ? raw.snapshots : []
     undoStack = list
       .map(x => {
@@ -1077,14 +1291,14 @@ async function loadUndo($: $) {
   }
 }
 
-async function saveUndo($: $) {
-  await $.fs.write(await undoPath($), `${JSON.stringify({ version: 1, snapshots: undoStack })}\n`)
+async function saveUndo($: $, planId: string) {
+  await $.fs.write(await undoPath($, planId), `${JSON.stringify({ version: 1, snapshots: undoStack })}\n`)
 }
 
-async function pushUndo($: $, snap: Snapshot) {
-  await loadUndo($)
+async function pushUndo($: $, planId: string, snap: Snapshot) {
+  await loadUndo($, planId)
   undoStack = [...undoStack, snap].slice(-UNDO_MAX)
-  await saveUndo($)
+  await saveUndo($, planId)
 }
 
 /** 這次操作的簡短說明（還原通知用），用介面語言與步驟名稱。 */
@@ -1108,14 +1322,16 @@ async function undoLabel($: $, base: WorkflowMap, op: Op): Promise<string> {
 
 /** 還原最近一次寫入之前的計劃（以一次新的寫入套用，經同一條合併路徑）；回傳通知文字。 */
 async function undoPlan($: $): Promise<string> {
-  await loadUndo($)
   const t = STR[await langNow($)]
+  const planId = await read($, BOUND)
+  if (!planId) return t.nothingToUndo
+  await loadUndo($, planId)
   const snap = undoStack[undoStack.length - 1]
   if (!snap) return t.nothingToUndo
   const r = await applyAndWrite($, { op: 'restore', nodes: snap.map.nodes, title: snap.map.title }, 'undo')
   if ('error' in r) return r.error
   undoStack = undoStack.slice(0, -1)
-  await saveUndo($)
+  await saveUndo($, planId)
   return t.undone(snap.label)
 }
 
@@ -1130,51 +1346,77 @@ async function historyPath($: $, map: WorkflowMap, stamp: string): Promise<strin
  * （Codex、Grok、其他 session）同時的修改。$.fs 沒有 rename，做不到原子寫入：每次寫入都是整份新內容。
  * 同一時間另一個寫入者換了計劃（planId 不同、而且有步驟）→ 不寫，請模型重試。
  */
-async function writeMerged($: $, base: WorkflowMap, ours: WorkflowMap, newPlan: boolean): Promise<WorkflowMap | string> {
-  const latest = await loadMap($)
-  let final = ours
-  if (!newPlan) {
-    // 檔案上已有另一個計劃（別的寫入者剛開了新計劃）：不寫。空檔／無檔不算衝突
-    if (latest.nodes.length > 0 && latest.planId !== base.planId)
-      return 'Another writer replaced the plan meanwhile; nothing was changed. Call op show and retry.'
-    final = mergeMaps(latest, ours)
-    const cycle = findCycle(final.nodes)
-    if (cycle) return `Merging with another writer's change would create a cycle (${cycle.join(' → ')}); nothing was changed. Call op show and retry.`
-  }
-  await $.fs.write(await filePath($), `${JSON.stringify(final, null, 2)}\n`)
+async function writeMerged($: $, planId: string, base: WorkflowMap, ours: WorkflowMap): Promise<WorkflowMap | string> {
+  const latest = await loadMap($, planId)
+  // 檔案上已有另一個計劃（別的寫入者剛開了新計劃）：不寫。空檔／無檔不算衝突
+  if (latest.nodes.length > 0 && latest.planId !== base.planId)
+    return 'Another writer replaced the plan meanwhile; nothing was changed. Call op show and retry.'
+  const final = mergeMaps(latest, ours)
+  const cycle = findCycle(final.nodes)
+  if (cycle) return `Merging with another writer's change would create a cycle (${cycle.join(' → ')}); nothing was changed. Call op show and retry.`
+  await $.fs.write(await planPathOf($, planId), `${JSON.stringify(final, null, 2)}\n`)
   return final
 }
 
-/** 套用一個操作並寫檔（模型的工具呼叫、子代理同步都走這裏）。 */
+/**
+ * 套用一個操作並寫檔（模型的工具呼叫、子代理同步、還原都走這裏），只作用於這個 session 綁定的計劃。
+ * 未綁定：new_plan／set_plan 開一個新計劃並綁定；其他操作回覆「未綁定」。
+ * 開新計劃（new_plan、或在已完成的計劃上 set_plan）：舊計劃只在沒有其他 session 綁著時才封存；有人共用就只解除綁定。
+ */
 export async function applyAndWrite($: $, op: Op, by?: string, fromAgent = false): Promise<{ error: string } | { map: WorkflowMap; text: string }> {
+  const planId = await read($, BOUND)
+  if (!planId && op.op !== 'new_plan' && op.op !== 'set_plan') return { error: await noPlanMessage($) }
   let base: WorkflowMap
   try {
-    base = await loadMap($)
+    base = await loadMap($, planId)
   } catch (err) {
-    return { error: `Could not read ${FILE}; nothing was changed: ${String(err).slice(0, 300)}` }
+    return { error: `Could not read the plan; nothing was changed: ${String(err).slice(0, 300)}` }
   }
   const now = await nowIso($)
   const r = applyOp(base, op, now, by)
   if ('error' in r) return { error: r.error }
   if (op.op === 'show') return { map: r.map, text: textDiagram(r.map, 60, 'en') }
-  // 還原用：記下這次寫入之前的計劃（還原本身不記，免得來回）
-  if (op.op !== 'restore' && (r.changed.length || r.removed.length || r.archive)) await pushUndo($, { at: now, label: await undoLabel($, base, op), map: base })
-  if (r.archive) {
-    // 先封存（以檔案上最新的內容為準），成功後才換新計劃
-    const latest = await loadMap($)
-    if (latest.nodes.length) await $.fs.write(await historyPath($, latest, now), `${JSON.stringify({ ...latest, archivedAt: now }, null, 2)}\n`)
+  const creating = !planId || r.archive
+  let final: WorkflowMap
+  if (creating) {
+    const sid = await sessionIdOf($)
+    if (planId && r.archive) {
+      const others = (await sessionsOn($, planId)).filter(x => x !== sid)
+      const latest = await loadMap($, planId)
+      if (others.length === 0 && latest.nodes.length) {
+        // 先封存（以檔案上最新的內容為準）；計劃檔本身標記封存（舊共用檔不改）
+        await $.fs.write(await historyPath($, latest, now), `${JSON.stringify({ ...latest, archivedAt: now }, null, 2)}\n`)
+        if (planId !== LEGACY_ID) await $.fs.write(await planPathOf($, planId), `${JSON.stringify({ ...latest, archivedAt: now }, null, 2)}\n`)
+      }
+    }
+    final = { ...r.map, sessions: [sid], createdBy: sid }
+    await $.fs.write(await planPathOf($, final.planId!), `${JSON.stringify(final, null, 2)}\n`)
+    await bindPlan($, final.planId!)
+  } else {
+    // 還原用：記下這次寫入之前的計劃（還原本身不記，免得來回）
+    if (op.op !== 'restore' && (r.changed.length || r.removed.length)) await pushUndo($, planId, { at: now, label: await undoLabel($, base, op), map: base })
+    const merged = await writeMerged($, planId, base, r.map)
+    if (typeof merged === 'string') return { error: merged }
+    final = merged
+    await update($, MAP, () => final)
+    await foldAll($)
+    await notifyTransitions($, base, final, fromAgent)
+    await registerProject($, final).catch(() => undefined)
   }
-  const final = await writeMerged($, base, r.map, r.archive || base.planId !== r.map.planId)
-  if (typeof final === 'string') return { error: final }
-  await update($, MAP, () => final)
-  await foldAll($)
-  if (!r.archive) await notifyTransitions($, base, final, fromAgent)
-  await registerProject($, final).catch(() => undefined)
   return { map: final, text: [r.info, opSummary(final, r.changed, r.removed)].filter(Boolean).join('\n') }
 }
 
 async function serveTool($: $, e: Record<string, unknown>): Promise<{ deny: string } | { result: string }> {
   const { tool: _t, tool_use_id: _u, agentId: _a, ...args } = e
+  // 加入／離開計劃（不改計劃內容）
+  if (args.op === 'join') {
+    if (typeof args.plan !== 'string' || !args.plan.trim()) return { deny: 'join needs plan: a plan id or title (see op show, or the list in the no-plan message)' }
+    return { result: await joinPlan($, args.plan) }
+  }
+  if (args.op === 'leave') {
+    await bindPlan($, '')
+    return { result: 'This session left its plan. Call new_plan to start a new one, or join one.' }
+  }
   const r = await applyAndWrite($, args as unknown as Op)
   if ('error' in r) return { deny: r.error }
   if (await read($, PENDING)) await update($, PENDING, () => false)

@@ -283,68 +283,83 @@ function card(rows: CardRow[], hot: boolean): Card {
 }
 
 /**
- * 卡片圖（≤ 3 行高）：[✓ 9 已完成] — [同層並行步驟一張卡] — … — [+5 稍後]。
- * 卡頂對齊，連接點在第一行中線，所以線都是直的、不會交叉。放不下的層算進「稍後」。
+ * 卡片圖：[✓ 9 已完成] — [同層並行步驟一張卡] — …。卡頂對齊，連接點在第一行中線，線都是直的、不會交叉。
+ * 放不下的層不畫，數目回傳為 hidden（介面在圖後畫一個可按的「+N 稍後」按鈕）。
+ * all = 全部顯示：每一層都畫，放不下就換到下一行（最多 maxRows 行；再多的仍算進 hidden）。
  */
-export function bandGraph(map: WorkflowMap, view: StageView, lang: Lang, T: Theme, maxW: number, clk: Clock = NO_CLOCK): Pic & { hidden: number } {
+export function bandGraph(
+  map: WorkflowMap,
+  view: StageView,
+  lang: Lang,
+  T: Theme,
+  maxW: number,
+  clk: Clock = NO_CLOCK,
+  o: { all?: boolean; maxRows?: number } = {},
+): Pic & { hidden: number } {
   const t = STR[lang]
   const ready = readyIds(map.nodes)
-  const cards: Card[] = []
-  let used = 0
-  const push = (c: Card) => {
-    cards.push(c)
-    used += (cards.length > 1 ? CARD_GAP : 0) + c.w
+  const maxRows = o.all ? (o.maxRows ?? 6) : 1
+  const rows: Card[][] = [[]]
+  const rowW = () => rows[rows.length - 1]!.reduce((w, c, i) => w + (i ? CARD_GAP : 0) + c.w, 0)
+  let hiddenSteps = [...view.later]
+  let stop = false
+  const place = (c: Card, steps: readonly WorkflowNode[]) => {
+    if (stop) return void hiddenSteps.push(...steps)
+    const row = rows[rows.length - 1]!
+    if (row.length && BAND_INSET + rowW() + CARD_GAP + c.w > maxW) {
+      if (rows.length >= maxRows) {
+        stop = true
+        return void hiddenSteps.push(...steps)
+      }
+      rows.push([c])
+      return
+    }
+    row.push(c)
   }
-  if (view.done.length) push(card([{ k: 'done', label: t.doneCard(view.done.length) }], false))
-  let later = [...view.later]
-  view.levels.forEach((lv, i) => {
-    if (later.length > view.later.length) return later.push(...lv)
+  if (view.done.length) place(card([{ k: 'done', label: t.doneCard(view.done.length) }], false), [])
+  view.levels.forEach(lv => {
     const shown = lv.length > 3 ? lv.slice(0, 2) : lv
-    const rows: CardRow[] = shown.map(n => ({ k: kindOf(n, ready, clk), ins: !!n.inserted, label: n.title, meta: metaOf(n, lang, clk, true) }))
-    if (lv.length > 3) rows.push({ label: t.moreRows(lv.length - 2), cls: 'd' })
-    const c = card(rows, lv.some(n => n.status === 'doing'))
-    const rest = later.length + view.levels.slice(i + 1).flat().length
-    const reserve = rest ? CARD_GAP + 20 + tw(t.laterCard(rest + lv.length)) + 20 : 0
-    if (i > 0 && BAND_INSET + used + CARD_GAP + c.w + reserve > maxW) return later.push(...lv)
-    push(c)
+    const cr: CardRow[] = shown.map(n => ({ k: kindOf(n, ready, clk), ins: !!n.inserted, label: n.title, meta: metaOf(n, lang, clk, true) }))
+    if (lv.length > 3) cr.push({ label: t.moreRows(lv.length - 2), cls: 'd' })
+    place(card(cr, lv.some(n => n.status === 'doing')), lv)
   })
-  later = later.filter((n, i, a) => a.indexOf(n) === i)
-  if (later.length) {
-    const ins = later.some(n => n.inserted)
-    push(card([{ k: ins ? 'todo' : undefined, ins, label: t.laterCard(later.length), cls: 'd' }], false))
-  }
-  // 卡先畫，線與連接點後畫（點蓋在卡邊上）
+  hiddenSteps = hiddenSteps.filter((n, i, a) => a.indexOf(n) === i)
+  // 卡先畫，線與連接點後畫（點蓋在卡邊上）；只連同一行之內的卡
   const parts: string[] = []
   const wires: string[] = []
-  const portY = 0.5 + 1 + CARD_ROW / 2
-  let x = 0
-  let height = 0
-  const dot = (cx: number, hot: boolean) =>
-    `<circle cx='${r1(cx)}' cy='${portY}' r='2.5' ${hot ? `fill='${T.run}'` : `fill='${T.ink}' fill-opacity='.3'`}/>`
-  cards.forEach((c, i) => {
-    if (i > 0) {
-      const x1 = x - CARD_GAP
-      const stroke = c.hot ? `stroke='${T.run}'` : `stroke='${T.ink}' stroke-opacity='.22'`
-      wires.push(`<path d='M${r1(x1)},${portY} H${r1(x)}' ${stroke} stroke-width='1.5'/>`, dot(x1, c.hot), dot(x, c.hot))
-    }
-    const h = 2 + c.rows.length * CARD_ROW
-    height = Math.max(height, h + 1)
-    parts.push(
+  let y0 = 0
+  let width = 0
+  for (const row of rows) {
+    if (!row.length) continue
+    const portY = y0 + 0.5 + 1 + CARD_ROW / 2
+    const dot = (cx: number, hot: boolean) =>
+      `<circle cx='${r1(cx)}' cy='${r1(portY)}' r='2.5' ${hot ? `fill='${T.run}'` : `fill='${T.ink}' fill-opacity='.3'`}/>`
+    let x = 0
+    let rowH = 0
+    row.forEach((c, i) => {
+      if (i > 0) {
+        const x1 = x - CARD_GAP
+        const stroke = c.hot ? `stroke='${T.run}'` : `stroke='${T.ink}' stroke-opacity='.22'`
+        wires.push(`<path d='M${r1(x1)},${r1(portY)} H${r1(x)}' ${stroke} stroke-width='1.5'/>`, dot(x1, c.hot), dot(x, c.hot))
+      }
+      const h = 2 + c.rows.length * CARD_ROW
+      rowH = Math.max(rowH, h + 1)
       // 卡面：比四周略亮的填色，沒有外框（與 app 自己的卡片一致）
-      `<rect x='${r1(x + 0.5)}' y='0.5' width='${r1(c.w - 1)}' height='${h}' rx='4' fill='${T.ink}' fill-opacity='.07'/>`,
-    )
-    c.rows.forEach((r, j) => {
-      const cy = 0.5 + 1 + j * CARD_ROW + CARD_ROW / 2
-      if (r.k) parts.push(icon(r.k, !!r.ins, x + ICON_X, cy, T))
-      // textLength 只在後面還有字時才用（否則估算誤差會把字距拉開）
-      parts.push(text(x + (r.k ? LABEL_X : 10), cy + 4, r.label, r.cls ?? '', { fixed: !!r.meta }))
-      if (r.meta) parts.push(text(x + (r.k ? LABEL_X : 10) + tw(r.label) + 6, cy + 4, r.meta, 'm', { fixed: true }))
+      parts.push(`<rect x='${r1(x + 0.5)}' y='${r1(y0 + 0.5)}' width='${r1(c.w - 1)}' height='${h}' rx='4' fill='${T.ink}' fill-opacity='.07'/>`)
+      c.rows.forEach((r, j) => {
+        const cy = y0 + 0.5 + 1 + j * CARD_ROW + CARD_ROW / 2
+        if (r.k) parts.push(icon(r.k, !!r.ins, x + ICON_X, cy, T))
+        // textLength 只在後面還有字時才用（否則估算誤差會把字距拉開）
+        parts.push(text(x + (r.k ? LABEL_X : 10), cy + 4, r.label, r.cls ?? '', { fixed: !!r.meta }))
+        if (r.meta) parts.push(text(x + (r.k ? LABEL_X : 10) + tw(r.label) + 6, cy + 4, r.meta, 'm', { fixed: true }))
+      })
+      x += c.w + CARD_GAP
     })
-    x += c.w + CARD_GAP
-  })
-  const hidden = later.length
+    width = Math.max(width, x - CARD_GAP)
+    y0 += rowH + 8
+  }
   // 與標題行之間留 4px
-  return { ...doc(BAND_INSET + x - CARD_GAP + 1, height + 4, T, `<g transform='translate(${BAND_INSET},4)'>${parts.join('')}${wires.join('')}</g>`), hidden }
+  return { ...doc(BAND_INSET + width + 1, y0 - 8 + 4, T, `<g transform='translate(${BAND_INSET},4)'>${parts.join('')}${wires.join('')}</g>`), hidden: hiddenSteps.length }
 }
 
 // ---------------- 全圖：GitLab 式階段卡（由上而下） ----------------
@@ -371,6 +386,12 @@ export function iconPic(k: Kind, ins: boolean, T: Theme): Pic {
 export function miniBar(done: number, total: number, T: Theme): Pic {
   const w = total ? Math.round((56 * done) / total) : 0
   return doc(60, 20, T, `<rect x='2' y='7' width='56' height='6' rx='3' fill='${T.ink}' fill-opacity='.3'/>` + (w ? `<rect x='2' y='7' width='${Math.max(6, w)}' height='6' rx='3' fill='${T.done}' fill-opacity='.7'/>` : ''))
+}
+
+/** 收起／展開的記號：細線「V」（像 app 下拉選單的箭咀），收起時向下、展開時向上；14×20，淡色。 */
+export function chevronPic(open: boolean, T: Theme): Pic {
+  const d = open ? 'M3,12 L7,8 L11,12' : 'M3,8 L7,12 L11,8'
+  return doc(14, 20, T, `<path d='${d}' fill='none' stroke='${T.dim}' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/>`)
 }
 
 /** 圖示欄的空位（20×20，沒有圖示的行用它，令文字對齊）。 */

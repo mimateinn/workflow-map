@@ -134,9 +134,17 @@ describe('lifecycle and merge', () => {
 })
 
 /** 記憶體檔案系統 + 引擎底層 stub。 */
-function world(on: On, files: Record<string, string>, store?: Record<string, unknown>) {
+/** 計劃資料夾內的計劃檔（不含備份）；最後一個 = 最新建立的 */
+const PLANS = `${ROOT}/.claude/workflow-map/plans/`
+const planFiles = (files: Record<string, string>) => Object.keys(files).filter(k => k.startsWith(PLANS) && !k.includes('.bad-') && !k.includes('-backup-'))
+const cur = (files: Record<string, string>) => JSON.parse(files[planFiles(files).at(-1)!]!)
+/** $.store 種子：sess-A 綁定某計劃（預設：舊共用檔 default） */
+const BIND = (planId = 'default', sid = 'sess-A') => ({ [`bind:${sid}`]: { root: ROOT, planId, at: NOW } })
+
+function world(on: On, files: Record<string, string>, store?: Record<string, unknown>, sid: { id: string } = { id: 'sess-A' }) {
   const toasts: string[] = []
   mock.store(on, store)
+  on('session.id', () => ({ value: sid.id }))
   const clock = mock.clock(on, { now: Date.parse(NOW) })
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.root', () => ({ value: ROOT }))
@@ -197,7 +205,7 @@ describe('multi-agent', () => {
     await $.tool.call({ tool: TOOL, op: 'set_plan', nodes: plan().nodes.map(({ id, title, status, deps }) => ({ id, title, status, deps })) })
     const spawn = (description: string, subagentType: string) =>
       $.agent.spawn({ tool_use_id: 't', prompt: 'do it', description, subagentType, provider: { plugin: 'engine', tier: 'core' }, parentModel: 'x' } as never)
-    const node = (id: string) => JSON.parse(files[FILE]!).nodes.find((n: { id: string }) => n.id === id)
+    const node = (id: string) => cur(files).nodes.find((n: { id: string }) => n.id === id)
     await spawn('Draw the UI [wm:C]', 'Builder')
     expect(node('C')).toMatchObject({ status: 'doing', owner: 'Builder' })
     await spawn('fail on purpose [wm:D]', 'Grok')
@@ -209,9 +217,9 @@ describe('multi-agent', () => {
     await $.turn.complete({ agentId: 'ag2', reason: 'error', turnId: 't2' } as never)
     expect(node('D').status).toBe('blocked')
     // 標記指向不存在的步驟：甚麼都不改
-    const before = files[FILE]
+    const before = files[planFiles(files).at(-1)!]
     await spawn('x [wm:nope]', 'Builder')
-    expect(files[FILE]).toBe(before)
+    expect(files[planFiles(files).at(-1)!]).toBe(before)
   })
 
   test('owner and elapsed time show on the band cards; staleMinutes 0 turns the amber mark off', { options: { staleMinutes: 0 } }, async ($, on) => {
@@ -259,8 +267,13 @@ describe('help', () => {
     // 不截斷：選單在不會被壓的格內，闊度 ≥ 最長選項（繁體中文 = 8 格）+ 4
     const langBox = await ui.find({ key: 'help-lang-box' })
     expect([langBox?.props.flexShrink, Number(langBox?.props.width) >= 8 + 4]).toEqual([0, true])
-    // 說明卡各段之間：app 的分隔線，段數 − 1 條
-    expect((await ui.findAll({ type: 'Markdown' })).filter(m => String(m.key).startsWith('help-div')).length).toBe(4)
+    // 第一行像設定頁：「Language」…… 選單、收起同一行
+    const langRow = await ui.find({ key: 'lang-row' })
+    expect(JSON.stringify(langRow)).toContain('help-lang')
+    expect(JSON.stringify(langRow)).toContain('help-close')
+    expect(langRow?.text).toContain('Language')
+    // 說明卡各段之間（語言、簡介、圖示、使用、AI、指令）：app 的分隔線，段數 − 1 條
+    expect((await ui.findAll({ type: 'Markdown' })).filter(m => String(m.key).startsWith('help-div')).length).toBe(5)
     await ui.select({ key: 'help-lang', value: 'ja' })
     expect(await allText(ui)).toContain('凡例')
     expect((await ui.find({ key: 'help-lang' }))?.props.value).toBe('ja')
@@ -327,15 +340,19 @@ describe('step detail', () => {
 })
 
 describe('persistence', () => {
-  test('a v1 file is backed up before it is migrated', async ($, on) => {
+  test('a v1 plan file is backed up before it is migrated; the legacy shared file is only read', async ($, on) => {
     const v1 = JSON.stringify({ version: 1, updatedAt: NOW, nodes: [{ id: 'A', title: 'a', status: 'doing', deps: [] }] })
-    const files: Record<string, string> = { [FILE]: v1 }
-    world(on, files)
+    const files: Record<string, string> = { [`${PLANS}old.json`]: v1, [FILE]: v1 }
+    world(on, files, BIND('old'))
     await $.session.start(START)
     const backups = Object.keys(files).filter(p => p.includes('.v1-backup-'))
     expect(backups.length).toBe(1)
     expect(files[backups[0]!]).toBe(v1)
-    expect(JSON.parse(files[FILE]!)).toMatchObject({ schemaVersion: 2, nodes: [{ id: 'A', title: 'a', status: 'doing' }] })
+    expect(JSON.parse(files[`${PLANS}old.json`]!)).toMatchObject({ schemaVersion: 2, nodes: [{ id: 'A', title: 'a', status: 'doing' }] })
+    // 舊共用檔：綁了它也只在記憶體轉換，檔案一字不改
+    await $.tool.call({ tool: TOOL, op: 'join', plan: 'default' })
+    expect(JSON.stringify(await $.tool.call({ tool: TOOL, op: 'show' }))).toContain('A a')
+    expect(files[FILE]).toBe(v1)
   })
 
   test('new_plan archives the current plan to the history folder; the tool answer is compact', async ($, on) => {
@@ -352,16 +369,20 @@ describe('persistence', () => {
     expect(r).not.toContain('s6 step 6')
     expect(JSON.stringify(await $.tool.call({ tool: TOOL, op: 'show' }))).toContain('s6 step 6')
     // 另一個寫入者（例如 Codex）同時加了一步：之後我們寫入不會蓋走它
-    const disk = JSON.parse(files[FILE]!)
+    const mine = planFiles(files).at(-1)!
+    const disk = JSON.parse(files[mine]!)
     disk.nodes.push({ id: 'ext', title: 'from codex', status: 'todo', deps: [], updatedAt: '2026-10-08T10:00:01.000Z' })
-    files[FILE] = JSON.stringify(disk)
+    files[mine] = JSON.stringify(disk)
     await $.tool.call({ tool: TOOL, op: 'status', id: 's4', status: 'doing' })
-    expect(JSON.parse(files[FILE]!).nodes.map((n: { id: string }) => n.id)).toContain('ext')
+    expect(JSON.parse(files[mine]!).nodes.map((n: { id: string }) => n.id)).toContain('ext')
     await $.tool.call({ tool: TOOL, op: 'new_plan', title: 'Next task', nodes: [{ id: 'n1', title: 'first' }] })
     const hist = Object.keys(files).filter(p => p.startsWith(`${ROOT}/.claude/workflow-map.history/`))
     expect(hist.length).toBe(1)
     expect(JSON.parse(files[hist[0]!]!).nodes.length).toBe(9)
-    expect(JSON.parse(files[FILE]!)).toMatchObject({ title: 'Next task', nodes: [{ id: 'n1' }] })
+    expect(cur(files)).toMatchObject({ title: 'Next task', nodes: [{ id: 'n1' }], sessions: ['sess-A'], createdBy: 'sess-A' })
+    // 舊計劃檔標記封存（清單不再列出），新計劃另一個檔
+    expect(JSON.parse(files[mine]!).archivedAt).toBeDefined()
+    expect(planFiles(files).length).toBe(2)
     // 全圖：歷史紀錄
     const ui = await $.ui.mount({ plugin: 'workflow-map', surface: 'desktop', component: 'Pane', requestId: 'workflow-map', props: { title: 'x', isFocused: false, bodyColumns: 90 } as never })
     await ui.press({ key: 'history' })
@@ -369,15 +390,23 @@ describe('persistence', () => {
     await ui.unmount()
   })
 
-  test('corrupt JSON is backed up, map starts empty, one toast', async ($, on) => {
-    const files: Record<string, string> = { [FILE]: '{ not json' }
-    const w = world(on, files)
+  test('a corrupt plan file is backed up, the plan starts empty, one toast', async ($, on) => {
+    const files: Record<string, string> = { [`${PLANS}p1.json`]: '{ not json' }
+    const w = world(on, files, BIND('p1'))
     await $.session.start(START)
     const backups = Object.keys(files).filter(p => p.includes('.bad-'))
     expect(backups.length).toBe(1)
     expect(files[backups[0]!]).toBe('{ not json')
-    expect(JSON.parse(files[FILE]!).nodes).toEqual([])
+    expect(JSON.parse(files[`${PLANS}p1.json`]!).nodes).toEqual([])
     expect(w.toasts.length).toBe(1)
+  })
+
+  test('a corrupt legacy shared file is never rewritten', async ($, on) => {
+    const files: Record<string, string> = { [FILE]: '{ not json' }
+    world(on, files, BIND())
+    await $.session.start(START)
+    expect(files[FILE]).toBe('{ not json')
+    expect(Object.keys(files).filter(p => p.includes('.bad-'))).toEqual([])
   })
 
   test('tool ops write the file and reject cycles', async ($, on) => {
@@ -393,10 +422,10 @@ describe('persistence', () => {
       ],
     })
     expect(r.deny).toBeUndefined()
-    expect(JSON.parse(files[FILE]!).nodes.length).toBe(2)
+    expect(cur(files).nodes.length).toBe(2)
     const bad = await $.tool.call({ tool: TOOL, op: 'upsert', nodes: [{ id: 'A', deps: ['B'] }] })
     expect(bad.deny ?? bad.text ?? '').toMatch(/cycle/)
-    expect(JSON.parse(files[FILE]!).nodes[0].deps).toEqual([])
+    expect(cur(files).nodes[0].deps).toEqual([])
   })
 })
 
@@ -525,7 +554,7 @@ describe('language and palette', () => {
 describe('language source', () => {
   test('a zh-Hans saved under the old key is ignored; a Traditional plan gives zh-Hant with no typed prompt', async ($, on) => {
     const plan = { version: 1, updatedAt: NOW, nodes: [{ id: 'a', title: '整理需求', status: 'doing', deps: [] }, { id: 'b', title: '檢查設計', status: 'todo', deps: ['a'] }] }
-    world(on, { [FILE]: JSON.stringify(plan) }, { lang: 'zh-Hans' })
+    world(on, { [FILE]: JSON.stringify(plan) }, { lang: 'zh-Hans', ...BIND() })
     await $.session.start(START)
     const ui = await $.ui.mount({ plugin: 'workflow-map', surface: 'desktop', component: 'Pane', requestId: 'workflow-map', props: { title: 'x', isFocused: false, bodyColumns: 90 } as never })
     const all = (await ui.findAll({ type: 'Text' })).map(s => s.text).join('\n')
@@ -547,13 +576,13 @@ describe('language source', () => {
     const submit = (text: string, kind: string) => $.prompt.submit({ text, origin: { kind } } as never)
     await submit('这个工作流程显示简体字了', 'task-notification')
     await submit('这个工作流程显示简体字了', 'peer-send-message')
-    expect(await empty()).toMatch(/^No workflow/)
+    expect(await empty()).toMatch(/^This session has no plan/)
     await submit('这个工作流程显示简体字了', 'composer')
-    expect(await empty()).toMatch(/^No workflow/) // 簡體 → 英文介面
+    expect(await empty()).toMatch(/^This session has no plan/) // 簡體 → 英文介面
     await submit('仲有唔該改善下嗰個縮圖右上角個16同埋加3個顯示好核突', 'composer')
-    expect(await empty()).toMatch(/^尚無/)
+    expect(await empty()).toMatch(/^這個工作階段還沒有計劃/)
     await submit('ok', 'composer')
-    expect(await empty()).toMatch(/^尚無/)
+    expect(await empty()).toMatch(/^這個工作階段還沒有計劃/)
   })
 })
 
@@ -584,8 +613,10 @@ describe('pane', () => {
     // 分段（原生面板的 Running／Finished N ⌄）：進行中、接著；已完成、稍後是可收起的分段標題
     expect(all).toContain('In progress\nStage 1 · 3 parallel')
     expect(all).toContain('Next\nStage 2 · 2 parallel')
-    expect((await ui.find({ key: 'fold-done' }))?.text).toBe('Done 5 ⌄')
-    expect((await ui.find({ key: 'fold-future' }))?.text).toBe('Later 2 ⌄')
+    // 按鈕只有字與數目；展開記號是我們畫的細線 V（像 app 下拉選單的箭咀）
+    expect((await ui.find({ key: 'fold-done' }))?.text).toBe('Done 5')
+    expect((await ui.find({ key: 'fold-future' }))?.text).toBe('Later 2')
+    expect((await ui.findAll({ type: 'Svg' })).filter(x => String(x.props.source).includes("M3,8 L7,12 L11,8")).length).toBe(2)
     for (const title of ['Card layout', 'Connectors', 'Dark theme', 'Screenshots']) expect(all).toContain(title)
     expect(all).not.toContain('Gather needs')
     expect(all).toContain('Builder · 25m')
@@ -615,9 +646,9 @@ describe('pane', () => {
     // 卡面：有填色、外框全透明（看不見外框）
     for (const f of frames) expect([f.props.backgroundColor, f.props.borderColor]).toEqual(['#ffffff0f', '#00000000'])
     // 卡內每一行都是 [圖示欄 20px][文字]：沒有圖示的行用同闊的空位
-    for (const svg of await ui.findAll({ type: 'Svg' })) if (svg.props.width !== undefined) expect(svg.props.width).toBe(20)
+    for (const svg of await ui.findAll({ type: 'Svg' })) if (svg.props.width !== undefined && svg.props.width !== 14) expect(svg.props.width).toBe(20) // 14 = 分段的展開記號
     await ui.press({ key: 'fold-done' })
-    expect((await ui.find({ key: 'fold-done' }))?.text).toBe('Done 5 ⌃')
+    expect((await ui.findAll({ type: 'Svg' })).filter(x => String(x.props.source).includes("M3,12 L7,8 L11,12")).length).toBe(1)
     expect(await allText(ui)).toContain('Gather needs')
     await ui.press({ key: 'fold-future' })
     expect(await allText(ui)).toContain('Stage 4')
@@ -702,7 +733,7 @@ const SUGGESTIONS = [
 
 /** 引擎底層：會回答的 fork、記錄輸入框。 */
 function suggestWorld(on: On, suggestions: readonly { label: string; prompt: string }[] = SUGGESTIONS, files: Record<string, string> = {}) {
-  world(on, files)
+  world(on, files, FILE in files ? BIND() : undefined)
   const filled: string[] = []
   const asked: string[] = []
   on('command.list', () => ({ value: [] }))
@@ -903,7 +934,7 @@ describe('suggestions (merged from next-steps)', () => {
     })
 
     for (const [name, content] of [
-      ['a corrupt (half-written) file', { [FILE]: plan.slice(0, plan.length / 2) }],
+      ['a corrupt (half-written) file', { [`${PLANS}p.json`]: plan.slice(0, plan.length / 2) }],
       ['no file', {}],
     ] as const) {
       test(`${name}: the fork alone`, async ($, on) => {
@@ -1070,7 +1101,7 @@ describe('undo', () => {
     await $.session.start(START)
     await $.tool.call({ tool: TOOL, op: 'set_plan', nodes: [{ id: 'A', title: 'Alpha' }, { id: 'B', title: 'Beta', deps: ['A'] }] })
     await $.tool.call({ tool: TOOL, op: 'status', id: 'A', status: 'doing' })
-    const node = (id: string) => JSON.parse(files[FILE]!).nodes.find((n: { id: string }) => n.id === id)
+    const node = (id: string) => cur(files).nodes.find((n: { id: string }) => n.id === id)
     expect(node('A').status).toBe('doing')
     await w.clock.advance(60_000)
     const r = await $.command.run({ command: 'workflow', args: 'undo', origin: { kind: 'composer' } } as never)
@@ -1082,12 +1113,13 @@ describe('undo', () => {
     const ui = await $.ui.mount({ plugin: 'workflow-map', surface: 'desktop', component: 'Pane', requestId: 'workflow-map', props: { title: 'x', isFocused: false, bodyColumns: 120 } as never })
     await ui.press({ key: 'undo' })
     await ui.unmount()
-    expect(JSON.parse(files[FILE]!).nodes).toEqual([])
-    expect(JSON.parse(files[FILE]!).tombstones.map((t: { id: string }) => t.id).sort()).toEqual(['A', 'B'])
+    // 再還原：回到建立計劃時的樣子之前（快照只在這個計劃內）→ 沒有更早的快照
+    expect(cur(files).nodes.map((n: { id: string }) => n.id)).toEqual(['A', 'B'])
     const again = await $.command.run({ command: 'workflow', args: 'undo', origin: { kind: 'composer' } } as never)
     expect(JSON.stringify(again)).toContain('Nothing to undo')
     for (let i = 0; i < 12; i++) await $.tool.call({ tool: TOOL, op: 'upsert', nodes: [{ id: `n${i}`, title: `n${i}` }] })
-    expect(JSON.parse(files[`${ROOT}/.claude/workflow-map.undo.json`]!).snapshots.length).toBe(10)
+    const planId = cur(files).planId
+    expect(JSON.parse(files[`${ROOT}/.claude/workflow-map/undo/${planId}.json`]!).snapshots.length).toBe(10)
   })
 })
 
@@ -1129,6 +1161,97 @@ describe('projects overview', () => {
     await ui.press({ key: 'project-2' })
     expect(await allText(ui)).toContain('This plan cannot be read')
     await ui.press({ key: 'project-back' })
+    await ui.unmount()
+  })
+})
+
+describe('per-session plans', () => {
+  test('two sessions in one root keep separate plans; new_plan never archives a plan another session uses; join shares one', async ($, on) => {
+    const files: Record<string, string> = {}
+    const sid = { id: 'sess-A' }
+    world(on, files, {}, sid)
+    await $.session.start(START)
+    await $.tool.call({ tool: TOOL, op: 'new_plan', title: 'Alpha work', nodes: [{ id: 'a1', title: 'Alpha one', status: 'doing' }] })
+    const alpha = planFiles(files).at(-1)!
+    // B：新 session，沒有綁定 → 看不見 A 的計劃
+    sid.id = 'sess-B'
+    await $.session.start(START)
+    const none = JSON.stringify(await $.tool.call({ tool: TOOL, op: 'show' }))
+    expect(none).toContain('No workflow plan is bound to this session')
+    expect(none).toContain('Alpha work')
+    await $.tool.call({ tool: TOOL, op: 'new_plan', title: 'Beta work', nodes: [{ id: 'b1', title: 'Beta one' }] })
+    expect(planFiles(files).length).toBe(2)
+    expect(JSON.parse(files[alpha]!).archivedAt).toBeUndefined()
+    expect(JSON.stringify(await $.tool.call({ tool: TOOL, op: 'show' }))).not.toContain('Alpha one')
+    // B 加入 A 的計劃：兩個 session 看同一份
+    await $.tool.call({ tool: TOOL, op: 'join', plan: 'Alpha work' })
+    expect(JSON.stringify(await $.tool.call({ tool: TOOL, op: 'show' }))).toContain('Alpha one')
+    // A 開新計劃：A 的舊計劃有 B 在用 → 不封存，只換成新計劃
+    sid.id = 'sess-A'
+    await $.session.start(START)
+    await $.tool.call({ tool: TOOL, op: 'new_plan', title: 'Gamma', nodes: [{ id: 'g1', title: 'Gamma one' }] })
+    expect(JSON.parse(files[alpha]!).archivedAt).toBeUndefined()
+    expect(Object.keys(files).filter(p => p.includes('workflow-map.history/'))).toEqual([])
+    sid.id = 'sess-B'
+    await $.session.start(START)
+    expect(JSON.stringify(await $.tool.call({ tool: TOOL, op: 'show' }))).toContain('Alpha one')
+  })
+
+  test('the legacy shared file stays byte-for-byte untouched by a session not bound to it; reload keeps the binding', async ($, on) => {
+    const legacy = JSON.stringify({ version: 1, updatedAt: NOW, nodes: [{ id: 'x', title: 'Other session work', status: 'doing', deps: [] }] })
+    const files: Record<string, string> = { [FILE]: legacy }
+    world(on, files)
+    await $.session.start(START)
+    await $.tool.call({ tool: TOOL, op: 'set_plan', nodes: [{ id: 'm', title: 'Mine', status: 'doing' }] })
+    await $.tool.call({ tool: TOOL, op: 'status', id: 'm', status: 'done' })
+    await $.tool.call({ tool: TOOL, op: 'new_plan', title: 'Next', nodes: [{ id: 'n', title: 'Next one' }] })
+    expect(files[FILE]).toBe(legacy)
+    // 重新載入（同一個 session）：仍然綁着自己的計劃
+    await $.session.start(START)
+    const shown = JSON.stringify(await $.tool.call({ tool: TOOL, op: 'show' }))
+    expect(shown).toContain('Next one')
+    expect(shown).not.toContain('Other session work')
+    expect(files[FILE]).toBe(legacy)
+  })
+
+  test('/workflow join and leave; the Plans card lists the project plans', async ($, on) => {
+    const legacy = JSON.stringify({ schemaVersion: 2, version: 1, planId: 'p', title: 'Shared', updatedAt: NOW, nodes: [{ id: 'x', title: 'Shared step', status: 'doing', deps: [] }] })
+    const files: Record<string, string> = { [FILE]: legacy }
+    world(on, files)
+    on('ui.open', () => ({ value: { isPlaced: true as const } }))
+    await $.session.start(START)
+    const ui = await $.ui.mount({ plugin: 'workflow-map', surface: 'desktop', component: 'Pane', requestId: 'workflow-map', props: { title: 'x', isFocused: false, bodyColumns: 120 } as never })
+    expect(await allText(ui)).toContain('This session has no plan yet')
+    await ui.press({ key: 'plans' })
+    expect(await allText(ui)).toContain('Shared')
+    await ui.press({ key: 'join-default' })
+    expect(await allText(ui)).toContain('Shared step')
+    await ui.unmount()
+    const r = await $.command.run({ command: 'workflow', args: 'leave', origin: { kind: 'composer' } } as never)
+    expect(JSON.stringify(r)).toContain('Left the plan')
+    expect(JSON.stringify(await $.tool.call({ tool: TOOL, op: 'show' }))).toContain('No workflow plan is bound')
+    const j = await $.command.run({ command: 'workflow', args: 'join Shared', origin: { kind: 'composer' } } as never)
+    expect(JSON.stringify(j)).toContain('Joined plan: Shared')
+    expect(files[FILE]).toBe(legacy)
+  })
+})
+
+describe('band later chip', () => {
+  test('"+N later" is a button after the graph; pressing shows the later steps, pressing again hides them', async ($, on) => {
+    world(on, {})
+    await $.session.start(START)
+    await $.command.run({ command: 'workflow-demo', args: '', origin: { kind: 'composer' } } as never)
+    const ui = await $.ui.mount({ plugin: 'workflow-map', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+    await ui.press({ key: 'toggle' })
+    const chip = await ui.find({ key: 'band-later' })
+    expect([chip?.type, chip?.text]).toEqual(['Button', '+2 later'])
+    expect(await svgText(ui)).not.toContain('Real-app check')
+    await ui.press({ key: 'band-later' })
+    expect(await svgText(ui)).toContain('Real-app check')
+    expect(await svgText(ui)).toContain('Release')
+    expect((await ui.find({ key: 'band-less' }))?.text).toBe('Hide later')
+    await ui.press({ key: 'band-less' })
+    expect(await svgText(ui)).not.toContain('Real-app check')
     await ui.unmount()
   })
 })

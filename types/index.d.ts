@@ -40,6 +40,10 @@ export type WorkflowMap = {
   archivedAt?: string
   nodes: WorkflowNode[]
   tombstones?: Tombstone[]
+  /** 綁著這個計劃的 session id（資訊用；真正的綁定在外掛的 $.store） */
+  sessions?: string[]
+  /** 建立這個計劃的 session id */
+  createdBy?: string
 }
 
 /** 下一句建議（併入自 next-steps） */
@@ -63,6 +67,10 @@ declare module 'claude-code' {
       futureOpen: boolean
       /** 全圖面板「歷史紀錄」是否展開 */
       historyOpen: boolean
+      /** 這個 session 綁定的計劃 id（'' = 未綁定） */
+      bound: string
+      /** 全圖面板「計劃」清單是否展開 */
+      plansOpen: boolean
       /** 全圖面板「專案」總覽是否展開 */
       projectsOpen: boolean
       /** 全圖面板正在唯讀檢視的另一個專案根目錄（'' = 本專案） */
@@ -71,6 +79,8 @@ declare module 'claude-code' {
       helpLang: string
       /** 下一句建議的狀態（併入自 next-steps） */
       suggest: SuggestView
+      /** 輸入框上方的卡片圖是否顯示全部步驟 */
+      bandAll: boolean
       /** 全圖面板最上面的說明卡是否打開 */
       helpOpen: boolean
       /** 全圖面板展開詳情的步驟 id（'' = 無） */
