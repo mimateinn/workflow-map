@@ -287,11 +287,13 @@ function card(rows: CardRow[], hot: boolean): Card {
  *   [✓ 5 已完成 ——]   [同層並行步驟一張卡 — … —●]   [- - +2 稍後（虛線幽靈卡）]
  * 左右兩張各自放在有 key 的 Box 內，指著時彈出清單（已完成／稍後的步驟）。
  * 中間的卡頂對齊，連接點在第一行中線，線都是直的。放不下的層算進「稍後」。
+ * 線與連接點只畫在兩端都有看得見的卡時（全部完成：只有已完成小卡，沒有線）。
  */
 export type BandGraph = {
-  /** 「✓ N 已完成」小卡＋接到下一張卡的線（沒有已完成步驟時 undefined） */
+  /** 「✓ N 已完成」小卡（後面有卡才有線；沒有已完成步驟時 undefined） */
   done?: Pic
-  main: Pic
+  /** 各層的卡（全部完成時沒有：只剩已完成小卡） */
+  main?: Pic
   /** 「+N 稍後」虛線幽靈卡＋虛線（沒有收起的步驟時 undefined） */
   ghost?: Pic
   /** 收起的步驟（計劃次序），給彈出清單用 */
@@ -352,14 +354,15 @@ export function bandGraph(map: WorkflowMap, view: StageView, lang: Lang, T: Them
   hiddenSteps.push(...view.later)
   const hidden = hiddenSteps.filter((n, i, a) => a.indexOf(n) === i)
 
-  // 左：已完成小卡 + 接到第一張卡的線
+  // 左：已完成小卡 + 接到第一張卡的線（後面沒有卡就不畫線）
   let done: Pic | undefined
   if (doneCard) {
     const parts: string[] = []
     const h = drawCard(doneCard, 0, parts)
-    const hot = placed[0]?.hot ?? false
-    parts.push(`<path d='M${r1(doneCard.w)},${r1(portY)} H${r1(doneCard.w + CARD_GAP)}' ${line(hot)}/>`, dot(doneCard.w, hot), dot(doneCard.w + CARD_GAP - 2.5, hot))
-    done = pic(BAND_INSET + doneCard.w + CARD_GAP, h, parts, BAND_INSET)
+    const next = placed[0]
+    if (next)
+      parts.push(`<path d='M${r1(doneCard.w)},${r1(portY)} H${r1(doneCard.w + CARD_GAP)}' ${line(next.hot)}/>`, dot(doneCard.w, next.hot), dot(doneCard.w + CARD_GAP - 2.5, next.hot))
+    done = pic(BAND_INSET + doneCard.w + (next ? CARD_GAP : 0), h, parts, BAND_INSET)
   }
   // 中：各層的卡與卡之間的線
   const parts: string[] = []
@@ -378,15 +381,17 @@ export function bandGraph(map: WorkflowMap, view: StageView, lang: Lang, T: Them
   })
   const end = Math.max(0, x - CARD_GAP)
   if (hidden.length) wires.push(dot(end, false))
-  const main = pic(end + (hidden.length ? 3 : 1), h, [...parts, ...wires])
+  const main = placed.length ? pic(end + (hidden.length ? 3 : 1), h, [...parts, ...wires]) : undefined
   // 右：虛線 + 「+N 稍後」幽靈卡
   let ghost: Pic | undefined
   if (hidden.length) {
     const ins = hidden.some(n => n.inserted)
     const gc = card([{ k: ins ? 'todo' : undefined, ins, label: t.laterCard(hidden.length), cls: 'd' }], false)
-    const gp: string[] = [`<path d='M0,${r1(portY)} H${r1(CARD_GAP - 3)}' ${line(false, true)}/>`]
-    const gh = drawCard(gc, CARD_GAP - 3, gp, true)
-    ghost = pic(CARD_GAP - 3 + gc.w + 1, gh, gp)
+    // 虛線只在左邊有卡時畫
+    const gx = placed.length || doneCard ? CARD_GAP - 3 : 0
+    const gp: string[] = gx ? [`<path d='M0,${r1(portY)} H${r1(gx)}' ${line(false, true)}/>`] : []
+    const gh = drawCard(gc, gx, gp, true)
+    ghost = pic(gx + gc.w + 1, gh, gp)
   }
   return { done, main, ghost, hiddenSteps: hidden, cards: placed.length, edges }
 }

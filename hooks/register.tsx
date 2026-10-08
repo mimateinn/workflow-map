@@ -799,9 +799,11 @@ export const register: Register = (on, options) => {
                 {peek(doneRows.slice(-PEEK_MAX), Math.max(0, doneRows.length - PEEK_MAX), 'left')}
               </Box>
             ) : null}
-            <Box key="graph-main" flexShrink={0}>
-              <Svg source={graph.main.source} alt={plainLines(map, lang).join('\n')} width={graph.main.width} height={graph.main.height} />
-            </Box>
+            {graph.main ? (
+              <Box key="graph-main" flexShrink={0}>
+                <Svg source={graph.main.source} alt={plainLines(map, lang).join('\n')} width={graph.main.width} height={graph.main.height} />
+              </Box>
+            ) : null}
             {graph.ghost ? (
               <Box key="peek-later" flexShrink={0}>
                 <Svg source={graph.ghost.source} alt={t.laterCard(graph.hiddenSteps.length)} width={graph.ghost.width} height={graph.ghost.height} />

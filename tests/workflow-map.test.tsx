@@ -1282,3 +1282,44 @@ describe('band ghost card and peek', () => {
     await ui.unmount()
   })
 })
+
+describe('band connectors', () => {
+  type El = { type?: string; props?: Record<string, unknown>; children?: El[] }
+  // 卡片圖裏看得見的圖（不算指著才出現的清單）
+  const pics = (el: El | undefined): string[] =>
+    !el || el.props?.display === 'none' ? [] : el.type === 'Svg' ? [String(el.props?.source)] : (el.children ?? []).flatMap(c => pics(c ?? undefined))
+  const graphOf = async (ui: { find: (q: { key: string }) => Promise<unknown> }) => (await ui.find({ key: 'graph' })) as El
+
+  test('all done: only the done chip, no edge or port dot; its hover list stays', async ($, on) => {
+    world(on, {})
+    await $.session.start(START)
+    await $.tool.call({ tool: TOOL, op: 'set_plan', nodes: plan().nodes.map(({ id, title, deps }) => ({ id, title, deps, status: 'done' })) })
+    const ui = await $.ui.mount({ plugin: 'workflow-map', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+    await ui.press({ key: 'toggle' })
+    const graph = await graphOf(ui)
+    expect((graph.children ?? []).filter(Boolean).map(c => c.props?.key)).toEqual(['peek-done'])
+    const svg = pics(graph).join('')
+    expect(svg).toContain('4 已完成')
+    expect(svg).not.toMatch(/ H\d/) // 沒有線
+    expect(svg).not.toContain("r='2.5'") // 沒有連接點
+    expect(JSON.stringify(graph)).toContain('寫 API') // 指著仍列出已完成的步驟
+    await ui.unmount()
+  })
+
+  test('the last visible card has no successor: no trailing edge or dot past it', async ($, on) => {
+    world(on, {})
+    await $.session.start(START)
+    await $.tool.call({ tool: TOOL, op: 'set_plan', nodes: plan().nodes.map(({ id, title, status, deps }) => ({ id, title, status, deps })) })
+    const ui = await $.ui.mount({ plugin: 'workflow-map', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+    await ui.press({ key: 'toggle' })
+    expect(await ui.find({ key: 'peek-later' })).toBeUndefined()
+    const main = pics((await ui.find({ key: 'graph-main' })) as El).join('')
+    const right = Math.max(...[...main.matchAll(/<rect x='([\d.]+)' y='[\d.]+' width='([\d.]+)'[^>]*rx='4'/g)].map(m => Number(m[1]) + Number(m[2])))
+    const ends = [...main.matchAll(/cx='([\d.]+)'[^>]*r='2.5'/g), ...main.matchAll(/ H([\d.]+)/g)].map(m => Number(m[1]))
+    expect(ends.length).toBeGreaterThan(0)
+    for (const x of ends) expect(x).toBeLessThan(right)
+    // 已完成小卡後面有卡：有線
+    expect(pics((await ui.find({ key: 'peek-done' })) as El).join('')).toMatch(/ H\d/)
+    await ui.unmount()
+  })
+})
