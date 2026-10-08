@@ -2,8 +2,9 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderChildren, UiPressArgument } from 'claude-code'
 
 import type { TodoItem, TodoMirror, WorkflowMap, WorkflowNode } from '../types/index'
-import { demoMap as demoPlan } from './demo'
-import { allDone, applyOp, compactLine, emptyMap, etaMin, exportMarkdown, findCycle, isActive, isStale, mergeMaps, migrate, opSummary, plainLines, readyIds, STATUSES, stageView, stats, textDiagram, validateMap } from './graph'
+import { demoMap as demoPlan, teamMap } from './demo'
+import { flowOutline, flowSvg, layoutFlow, outlineText } from './flow'
+import { allDone, applyOp, compactLine, emptyMap, etaMin, exportMarkdown, findCycle, isActive, isStale, isStep, KINDS, mergeMaps, migrate, opSummary, plainLines, readyIds, STATUSES, stageView, stats, textDiagram, timeline, validateMap } from './graph'
 import type { Op } from './graph'
 import { detectLang, HELP_TABS, LANGS, looksLikeRequest, resolveLang, STR } from './i18n'
 import type { Lang } from './i18n'
@@ -11,7 +12,7 @@ import { CAPSULE_CELLS, CAPSULE_CHROME, cells, fitCells, forkPrompt, languageRul
 import type { Suggestion, SuggestView } from './suggest'
 import { bandCards, barSegs, glyph, headerSegs } from './tui'
 import type { Seg } from './tui'
-import { amberPic, bandGraph, bandHeader, chevronPic, detailLines, fmtTime, iconPic, kindOf, metaOf, miniBar, paneBar, paneCards, paneStatus, PX_PER_COL, slotPic, STAR_W, starPic, THEMES } from './svg'
+import { amberPic, bandGraph, bandHeader, chevronPic, detailLines, fmtTime, iconPic, insHot, insMark, kindOf, metaOf, miniBar, paneBar, paneCards, paneStatus, PX_PER_COL, slotPic, STAR_W, starPic, THEMES } from './svg'
 import type { Clock, Kind } from './svg'
 
 const TOOL = 'mcp__workflow-map__workflow_map'
@@ -76,7 +77,16 @@ const EXPANDED = atom({ plugin: 'workflow-map', key: 'expanded' } as const, fals
 const PENDING = atom({ plugin: 'workflow-map', key: 'pending' } as const, false)
 const DONE_TURNS = atom({ plugin: 'workflow-map', key: 'doneTurns' } as const, 0)
 /** /workflow-demo：只在畫面顯示示範資料，不寫檔、不碰真資料 */
-const DEMO = atom({ plugin: 'workflow-map', key: 'demo' } as const, false)
+const DEMO = atom({ plugin: 'workflow-map', key: 'demo' } as const, '' as '' | 'basic' | 'team')
+/** 全圖面板：流程圖（true）或階段卡（false）；本 session 記住 */
+const DIAGRAM = atom({ plugin: 'workflow-map', key: 'diagram' } as const, false)
+/** 全圖面板：正在看「插入前的計劃」的插入步驟 id（'' = 沒有） */
+const BEFORE = atom({ plugin: 'workflow-map', key: 'before' } as const, '')
+/** 全圖面板「時間線」是否展開；最多列出最近 TIMELINE_MAX 項 */
+const TIMELINE_OPEN = atom({ plugin: 'workflow-map', key: 'timelineOpen' } as const, false)
+const TIMELINE_MAX = 40
+/** 插入前的計劃（每個插入步驟一份，不受還原的 10 份上限影響）：SNAP_DIR/<planId>/<步驟 id>.json */
+const SNAP_DIR = '.claude/workflow-map/snapshots'
 const DONE_OPEN = atom({ plugin: 'workflow-map', key: 'doneOpen' } as const, false)
 const FUTURE_OPEN = atom({ plugin: 'workflow-map', key: 'futureOpen' } as const, false)
 const HISTORY_OPEN = atom({ plugin: 'workflow-map', key: 'historyOpen' } as const, false)
@@ -146,7 +156,9 @@ const DESCRIPTION =
   "set_plan {nodes} replaces this plan's steps; upsert {nodes} changes only the given fields; status {id,status,note?}; " +
   'insert {nodes,note,before?} records work the USER interjected mid-plan (note = their words; deps = what it waits for; ' +
   'before = existing ids that must now wait for it); remove {ids}; show returns the full graph. ' +
-  'Node: {id, title, status: todo|doing|done|blocked|dropped, deps: [ids it waits for], owner?, note?}. ' +
+  'Node: {id, title, status: todo|doing|done|blocked|dropped, deps: [ids it waits for], owner?, note?, lane?, kind?, edgeLabel?}. ' +
+  'lane groups steps into one box in the diagram view; kind: step (default), decision (a question) or note (a warning, not a step); ' +
+  'edgeLabel: a short label for what leads into this step (shown as "via …"). ' +
   'Steps sharing no deps path run in parallel. Cycles and unknown deps are rejected. ' +
   'Other ops return a one-line summary plus the changed steps and their neighbours. ' +
   'join {plan} binds this session to an existing plan of the project (to share it); leave unbinds. ' +
@@ -167,7 +179,9 @@ const SCHEMA = {
           title: { type: 'string', description: "user's language, concise, ≤ 8 CJK / ≤ 20 Latin characters, no jargon" },
           status: { type: 'string', enum: STATUSES },
           deps: { type: 'array', items: { type: 'string' }, description: 'ids that must finish first' },
-          lane: { type: 'string' },
+          lane: { type: 'string', description: 'group name: steps with the same lane are drawn in one box, e.g. "Review"' },
+          kind: { type: 'string', enum: KINDS, description: 'step (default), decision (a question), note (a warning shown in the diagram, not a step)' },
+          edgeLabel: { type: 'string', description: 'short label for what leads into this step, shown as "via …", e.g. "only if unsure"' },
           note: { type: 'string' },
           owner: { type: 'string', description: 'who does it: a sub-agent type or name, "me", …' },
         },
@@ -183,13 +197,14 @@ const SCHEMA = {
   required: ['op'],
 }
 
-// 每次對話都會帶上（裝了外掛就有，用戶不用改 CLAUDE.md）：保持 ≤ ~110 字。autoPlan = false 時只帶 GUIDE_MIN。
+// 每次對話都會帶上（裝了外掛就有，用戶不用改 CLAUDE.md）：保持 ≤ 120 字。autoPlan = false 時只帶 GUIDE_MIN。
 const GUIDE =
-  `# Workflow map\nThis session has its own plan, shown live to the user. For any task with 3+ steps:\n` +
+  `# Workflow map\nThis session's plan is shown live to the user. For any task with 3+ steps:\n` +
   `- At the start, call ${TOOL} new_plan (honest deps: independent steps share none).\n` +
-  '- Keep statuses current as you work: doing when a step starts, done or blocked when it ends.\n' +
+  '- Keep statuses current: doing when a step starts, done or blocked when it ends.\n' +
   '- When the user adds a request mid-plan, record it with insert (note = their words) BEFORE acting on it.\n' +
   '- When delegating a step to a sub-agent, put [wm:<step id>] in its description.\n' +
+  '- Many parallel workers: group them with lane (e.g. "Review"), label key arrows with edgeLabel.\n' +
   "- Titles in the user's language, plain words, no jargon, ≤ 8 CJK / 20 Latin characters.\n" +
   '- An unrelated new task: new_plan again.'
 const GUIDE_MIN = `# Workflow map\n${TOOL} shows a plan to the user. Use it only when the user asks for one; then keep statuses current. Titles in the user's language.`
@@ -262,7 +277,9 @@ async function notifyTransitions($: $, before: WorkflowMap, after: WorkflowMap, 
 let staleMinutes = 30
 const clockOf = async ($: $): Promise<Clock> => {
   await read($, TICK)
-  return { now: await $.clock.now(), staleMin: staleMinutes }
+  const now = await $.clock.now()
+  // 示範：當作本輪 20 分鐘前開始（示範裏 14 分鐘前插入的步驟算本輪，用紫色）
+  return { now, staleMin: staleMinutes, turnAt: (await read($, DEMO)) ? now - 20 * 60_000 : await read($, TURN_AT) }
 }
 /** 用戶最近一次輸入的文字判斷出的語言（存在 $.store，跨 session） */
 const LANG = atom({ plugin: 'workflow-map', key: 'lang' } as const, '')
@@ -276,10 +293,13 @@ const langNow = async ($: $): Promise<Lang> =>
   resolveLang(languageSetting, await read($, LANG), detectLang((await shownMap($)).nodes.map(n => n.title).join(' ')))
 
 /** 示範資料：時間按現在推算，標題跟介面語言（設定 → 用戶輸入過的語言 → 英文），只在畫面使用 */
-async function demoMap($: $): Promise<WorkflowMap> {
-  return demoPlan(await $.clock.now(), resolveLang(languageSetting, await read($, LANG)))
+async function demoMap($: $, team: boolean): Promise<WorkflowMap> {
+  return (team ? teamMap : demoPlan)(await $.clock.now(), resolveLang(languageSetting, await read($, LANG)))
 }
-const shownMap = async ($: $) => ((await read($, DEMO)) ? demoMap($) : read($, MAP))
+const shownMap = async ($: $) => {
+  const d = await read($, DEMO)
+  return d ? demoMap($, d === 'team') : read($, MAP)
+}
 
 const sessionIdOf = async ($: $) => {
   try {
@@ -394,6 +414,7 @@ async function bindPlan($: $, planId: string) {
   else await $.store.delete(bindKey(sid)).catch(() => undefined)
   undoFor = ''
   undoStack = []
+  if (await read($, BEFORE)) await update($, BEFORE, () => '')
   const map = await loadMap($, planId).catch(() => emptyMap())
   await update($, MAP, () => map)
   await foldAll($)
@@ -728,11 +749,15 @@ export const register: Register = (on, options) => {
     return result
   })
 
-  on('command.run', { command: 'workflow-demo' }, async $ => {
-    const isOn = !(await read($, DEMO))
-    await update($, DEMO, () => isOn)
+  // /workflow-demo：基本示範（開／關）；/workflow-demo team：團隊示範，並把全圖切到流程圖
+  on('command.run', { command: 'workflow-demo' }, async ($, e) => {
+    const team = /^team$/i.test(String((e as { args?: unknown }).args ?? '').trim())
+    const want = team ? 'team' : 'basic'
+    const next = (await read($, DEMO)) === want ? '' : want
+    await update($, DEMO, () => next)
+    if (next === 'team') await update($, DIAGRAM, () => true)
     const t = STR[await langNow($)]
-    return { text: isOn ? t.demoOn : t.demoOff }
+    return { text: next === 'team' ? t.demoTeamOn : next ? t.demoOn : t.demoOff }
   })
 
   on('command.run', { command: ['workflow', 'workflow-map'] }, async ($, e) => {
@@ -761,6 +786,8 @@ export const register: Register = (on, options) => {
       $.ui.toast(msg)
       return { text: msg }
     }
+    // /workflow diagram：以流程圖打開全圖
+    if (/^(diagram|flow|流程圖)$/i.test(arg)) await update($, DIAGRAM, () => true)
     // /workflow help：打開全圖並展開說明卡
     const wantHelp = /^(help|說明|说明|\?)$/i.test(arg)
     if (wantHelp !== (await read($, HELP_OPEN))) await update($, HELP_OPEN, () => wantHelp)
@@ -939,7 +966,7 @@ export const register: Register = (on, options) => {
         >
           {rows.map(({ n, hint }) => (
             <Box flexDirection="column">
-              {peekLine(<Svg source={iconPic(kindOf(n, ready, clock), !!n.inserted, T).source} alt={t.status[n.status]} width={ICON_COL} height={ICON_COL} />, n.title, false)}
+              {peekLine(<Svg source={iconPic(kindOf(n, ready, clock), insHot(n, clock), T).source} alt={t.status[n.status]} width={ICON_COL} height={ICON_COL} />, `${insMark(n, clock) ? '◇ ' : ''}${n.title}`, false)}
               {peekLine(<Svg source={slotPic(T).source} alt="" width={ICON_COL} height={ICON_COL} />, hint, true)}
             </Box>
           ))}
@@ -957,7 +984,7 @@ export const register: Register = (on, options) => {
         </Box>
       )
       const waitsOf = (n: (typeof map.nodes)[number]) => {
-        const w = n.deps.map(d => byId.get(d)).filter(d => d && d.status !== 'done' && d.status !== 'dropped')
+        const w = n.deps.map(d => byId.get(d)).filter(d => d && isStep(d) && d.status !== 'done')
         return w.length ? t.waitShort(w.map(d => d!.title).join(t.list)) : ''
       }
       const laterRows = (graph?.hiddenSteps ?? []).map(n => ({ n, hint: waitsOf(n) }))
@@ -1048,7 +1075,13 @@ export const register: Register = (on, options) => {
     const foreign = viewRoot !== '' && viewRoot !== ownRoot ? viewRoot : undefined
     const foreignEntry = foreign ? (await readProjects($)).find(p => p.root === foreign) : undefined
     const foreignMap = foreign ? await readForeign($, foreign, foreignEntry?.planId || LEGACY_ID) : undefined
-    const map = foreign ? (foreignMap ?? emptyMap()) : await shownMap($)
+    const current = foreign ? (foreignMap ?? emptyMap()) : await shownMap($)
+    // 插入前的計劃（唯讀）：檔案 SNAP_DIR/<planId>/<id>.json；示範時由示範資料拿走插入的步驟推算
+    const beforeId = foreign ? '' : await read($, BEFORE)
+    const beforeNode = beforeId ? current.nodes.find(n => n.id === beforeId) : undefined
+    const beforeMap = beforeId ? await snapshotOf($, current, beforeId) : undefined
+    const map = beforeId ? (beforeMap ?? emptyMap()) : current
+    const diagram = await read($, DIAGRAM)
     const projectName = (root: string) => root.split(/[\\/]/).filter(Boolean).pop() ?? root
     const backButton = <Button key="project-back" {...ICON_BTN} label={`← ${t.back}`} onPress={() => update($, VIEW_ROOT, () => '')} />
     const banner = foreign ? (
@@ -1057,6 +1090,40 @@ export const register: Register = (on, options) => {
         <Text bold>{t.viewing(projectName(foreign))}</Text>
       </Box>
     ) : null
+    const titlesOf = (ids: readonly string[]) => ids.map(id => current.nodes.find(n => n.id === id)?.title ?? id).join(t.list)
+    const beforeBanner = beforeId ? (
+      <Box key="before" flexDirection="column">
+        <Box flexDirection="row" alignItems="center" gap={SPACE.GAP}>
+          <Button key="before-back" {...ICON_BTN} label={`← ${t.back}`} onPress={() => update($, BEFORE, () => '')} />
+          <Box flexShrink={1} minWidth={0} overflow="hidden">
+            <Text dimColor wrap="truncate-end">
+              {t.beforeBanner(beforeNode?.title ?? beforeId)}
+            </Text>
+          </Box>
+        </Box>
+        {beforeNode?.impact
+          ? [
+              beforeNode.impact.added.length ? t.diffAdded(titlesOf(beforeNode.impact.added)) : '',
+              beforeNode.impact.rewired.length ? t.diffRewired(titlesOf(beforeNode.impact.rewired)) : '',
+            ]
+              .filter(Boolean)
+              .map((l, i) => (
+                <Box key={`diff-${i}`}>
+                  <Text dimColor wrap="truncate-end">
+                    {l}
+                  </Text>
+                </Box>
+              ))
+          : null}
+      </Box>
+    ) : null
+    if (beforeId && !beforeMap)
+      return (
+        <Box flexDirection="column" paddingLeft={PANE_INSET} gap={SPACE.GAP}>
+          {beforeBanner}
+          <Text dimColor>{t.beforeMissing}</Text>
+        </Box>
+      )
     if (foreign && !foreignMap)
       return (
         <Box flexDirection="column">
@@ -1070,10 +1137,13 @@ export const register: Register = (on, options) => {
       // 未綁定計劃：說明 + 打開「計劃」清單可以加入本專案的計劃
       return (
         <Box flexDirection="column" paddingLeft={PANE_INSET} gap={SPACE.GAP}>
+          {beforeBanner}
           <Text dimColor>{(await read($, BOUND)) ? t.empty : t.noPlanBound}</Text>
-          <Box flexDirection="row">
-            <Button key="plans" {...ICON_BTN} label={t.plans} onPress={() => update($, PLANS_OPEN, () => true)} />
-          </Box>
+          {beforeId ? null : (
+            <Box flexDirection="row">
+              <Button key="plans" {...ICON_BTN} label={t.plans} onPress={() => update($, PLANS_OPEN, () => true)} />
+            </Box>
+          )}
         </Box>
       )
     }
@@ -1091,16 +1161,20 @@ export const register: Register = (on, options) => {
     // 分段（原生面板的「Running」「Finished 172 ⌄」）：進行中、接著、已完成 N ⌄、稍後 N ⌄（後兩段可收起）
     const doneShown = doneOpen || !base.foldDone
     // 工具列（標題行下一行，貼右）：匯出、歷史、說明
+    const timelineOpen = await read($, TIMELINE_OPEN)
+    const readOnly = !!foreign || !!beforeId
     const tools = [
-      ...(foreign
+      { key: 'diagram', label: diagram ? t.stagesBtn : t.diagramBtn, onPress: () => update($, DIAGRAM, v => !v) },
+      ...(readOnly ? [] : [{ key: 'timeline', label: timelineOpen ? t.hideTimeline : t.timelineBtn, onPress: () => update($, TIMELINE_OPEN, v => !v) }]),
+      ...(readOnly
         ? []
         : [
             { key: 'undo', label: t.undoBtn, onPress: async () => $.ui.toast(await undoPlan($)) },
             { key: 'export', label: t.exportBtn, onPress: async (press: UiPressArgument) => $.ui.toast(await exportPlan($, press.surface)) },
             { key: 'history', label: historyOpen ? t.hideHistory : t.history, onPress: () => update($, HISTORY_OPEN, v => !v) },
           ]),
-      ...(foreign ? [] : [{ key: 'plans', label: plansOpen ? t.hidePlans : t.plans, onPress: () => update($, PLANS_OPEN, v => !v) }]),
-      { key: 'projects', label: projectsOpen ? t.hideProjects : t.projects, onPress: () => update($, PROJECTS_OPEN, v => !v) },
+      ...(readOnly ? [] : [{ key: 'plans', label: plansOpen ? t.hidePlans : t.plans, onPress: () => update($, PLANS_OPEN, v => !v) }]),
+      ...(beforeId ? [] : [{ key: 'projects', label: projectsOpen ? t.hideProjects : t.projects, onPress: () => update($, PROJECTS_OPEN, v => !v) }]),
     ]
     const plans = plansOpen && !foreign ? await listPlans($) : []
     const mySession = await sessionIdOf($)
@@ -1193,6 +1267,24 @@ export const register: Register = (on, options) => {
     const rowChrome = PANE_INSET + 2 + 2 * SPACE.PAD + (Svg ? 3 : 1) + 2 * SPACE.GAP
     const titleRoom = (r: (typeof cards)[number]['rows'][number], detail: string) =>
       cols - rowChrome - (r.info ? cells(r.info) + SPACE.GAP : 0) - (r.status ? cells(r.status) + SPACE.GAP : 0) - (cells(detail) + 2)
+    // 打開了詳情的插入步驟：它的影響（之後要等它的步驟）在階段卡用紫點、在流程圖用紫框標出
+    const selNode = map.nodes.find(n => n.id === selected)
+    const impactIds = new Set(selNode?.impact ? [...selNode.impact.rewired, ...selNode.impact.downstream] : [])
+    const violet = Svg ? T.ins : 'merged'
+    // 詳情的行（插入的步驟另有「插入前的計劃」按鈕；唯讀檢視時沒有）
+    const hasBefore = !readOnly && selNode?.inserted ? (await snapshotOf($, map, selNode.id, true)) !== undefined : false
+    const detailRows = (n: (typeof map.nodes)[number]) => [
+      ...detailLines(map, n, lang, clock).map((l, i) =>
+        line(
+          `detail-${i}`,
+          iconCol(undefined, false, ''),
+          <Text dimColor wrap="wrap">
+            {l}
+          </Text>,
+        ),
+      ),
+      n.inserted && hasBefore ? line('before-btn', iconCol(undefined, false, ''), btn(`before:${n.id}`, t.beforeBtn, () => update($, BEFORE, () => n.id))) : null,
+    ]
     // 一張階段卡：卡頭（已完成段不用，段標題已說了）＋ 各步，步與步之間 app 的分隔線
     const stageCard = (c: (typeof cards)[number], bare: boolean) =>
       card(c.key, [
@@ -1207,13 +1299,15 @@ export const register: Register = (on, options) => {
             <Box key={`row:${r.n.id}`} flexDirection="column">
               {line(
                 'main',
-                iconCol(r.k, !!r.n.inserted, r.status || t.status[r.n.status]),
+                iconCol(r.k, r.ins, r.status || t.status[r.n.status]),
+                r.mark ? fixed('ins-mark', '◇', undefined, true) : null,
                 shrink(
                   'title',
                   <Text wrap="truncate-end" dimColor={r.k === 'todo'}>
                     {r.n.title}
                   </Text>,
                 ),
+                impactIds.has(r.n.id) ? fixed('impact', '•', violet) : null,
                 <Box flexGrow={1} />,
                 ...(wide ? metaParts : []),
                 <Box key="detail-btn" flexShrink={0}>
@@ -1227,23 +1321,13 @@ export const register: Register = (on, options) => {
                     iconCol(undefined, false, ''),
                     shrink(
                       'sub-t',
-                      <Text dimColor={!r.n.inserted} color={r.n.inserted ? (Svg ? T.ins : 'merged') : undefined} wrap="truncate-end">
+                      <Text dimColor={!r.ins} color={r.ins ? violet : undefined} wrap="truncate-end">
                         {r.sub}
                       </Text>,
                     ),
                   )
                 : null}
-              {open
-                ? detailLines(map, r.n, lang, clock).map((l, i) =>
-                    line(
-                      `detail-${i}`,
-                      iconCol(undefined, false, ''),
-                      <Text dimColor wrap="wrap">
-                        {l}
-                      </Text>,
-                    ),
-                  )
-                : null}
+              {open ? detailRows(r.n) : null}
             </Box>,
           ]
         }),
@@ -1277,6 +1361,65 @@ export const register: Register = (on, options) => {
         : []),
     ]
     const paneEta = etaMin(map, clock.now)
+    // 流程圖：桌面一張圖（闊 = 面板格數 × 每格 px，1:1）；終端機是按組的縮排大綱
+    const outline = diagram ? flowOutline(map, lang, Math.max(20, cols - PANE_INSET - 1), clock) : []
+    let diagramPic: { source: string; width: number; height: number } | undefined
+    if (diagram && Svg) {
+      const lay = layoutFlow(map, { width: Math.max(240, Math.round(cols * PX_PER_COL) - 16), lang })
+      diagramPic = flowSvg(map, lay, lang, T, clock, impactIds)
+      // Svg 的內容上限 131072 字（約 250 步以上才會超過）：超過就改用文字大綱
+      if (diagramPic.source.length > 131072) diagramPic = undefined
+    }
+    // 中途加的要求（流程圖下面）：每項可開詳情（影響、插入前的計劃）
+    const requests = map.nodes.filter(n => n.inserted && n.status !== 'dropped')
+    const diagramView = diagram ? (
+      <Box key="diagram" flexDirection="column" marginTop={SPACE.GAP}>
+        {diagramPic && Svg ? (
+          <Box key="diagram-pic" flexShrink={0}>
+            <Svg source={diagramPic.source} alt={outlineText(outline)} width={diagramPic.width} height={diagramPic.height} />
+          </Box>
+        ) : (
+          <Box key="diagram-outline" flexDirection="column">
+            {outline.map((l, i) => segLine(`fl${i}`, l))}
+          </Box>
+        )}
+        {requests.length
+          ? card('requests', [
+              line('head', iconCol(undefined, false, ''), <Text bold>{t.requestsTitle}</Text>),
+              ...requests.flatMap((n, i) => {
+                const open = n.id === selected
+                return [
+                  i > 0 ? divider(`req-div-${i}`) : null,
+                  <Box key={`req:${n.id}`} flexDirection="column">
+                    {line(
+                      'main',
+                      iconCol(kindOf(n, readyIds(map.nodes), clock), insHot(n, clock), t.status[n.status]),
+                      insMark(n, clock) ? fixed('ins-mark', '◇', undefined, true) : null,
+                      shrink('title', <Text wrap="truncate-end">{n.title}</Text>),
+                      <Box flexGrow={1} />,
+                      <Box key="detail-btn" flexShrink={0}>
+                        {btn(`detail:${n.id}`, open ? t.detailClose : t.detailOpen, () => update($, SELECTED, v => (v === n.id ? '' : n.id)))}
+                      </Box>,
+                    )}
+                    {line(
+                      'sub',
+                      iconCol(undefined, false, ''),
+                      shrink(
+                        'sub-t',
+                        <Text color={insHot(n, clock) ? violet : undefined} dimColor={!insHot(n, clock)} wrap="truncate-end">
+                          {n.inserted!.note}
+                        </Text>,
+                      ),
+                    )}
+                    {open ? detailRows(n) : null}
+                  </Box>,
+                ]
+              }),
+            ])
+          : null}
+      </Box>
+    ) : null
+    const events = timelineOpen && !readOnly ? timeline(map, lang) : []
     // 說明卡：小標題（粗）＋ 圖示表
     const section = (key: string, title: string) => (
       <Box key={`${key}-t`}>
@@ -1321,6 +1464,7 @@ export const register: Register = (on, options) => {
     return (
       <Box flexDirection="column" paddingLeft={PANE_INSET} paddingRight={0}>
         {banner}
+        {beforeBanner}
         <Box key="head" flexDirection="row" alignItems="center" gap={SPACE.GAP}>
           {/* 進度條在可縮的格內（preserveAspectRatio none）：窄時縮條，不縮數字 */}
           <Box flexGrow={Svg ? 1 : 0} flexShrink={1} overflow="hidden">
@@ -1363,10 +1507,13 @@ export const register: Register = (on, options) => {
             </Box>
           ) : null}
         </Box>
-        <Box key="tools" flexDirection="row" alignItems="center" gap={SPACE.GAP}>
-          <Box flexGrow={1} />
-          {tools.map(b => btn(b.key, b.label, b.onPress))}
-          {btn('help', t.help, () => update($, HELP_OPEN, v => !v))}
+        {/* 工具列貼右；放不下時整個按鈕移到下一行（按鈕本身不縮、不斷字） */}
+        <Box key="tools" flexDirection="row" flexWrap="wrap" justifyContent="flex-end" alignItems="center" gap={SPACE.GAP}>
+          {[...tools, { key: 'help', label: t.help, onPress: () => update($, HELP_OPEN, v => !v) }].map(b => (
+            <Box key={`tb-${b.key}`} flexShrink={0}>
+              {btn(b.key, b.label, b.onPress)}
+            </Box>
+          ))}
         </Box>
         {helpOpen
           ? card('help', [
@@ -1422,6 +1569,7 @@ export const register: Register = (on, options) => {
               ...(
                 [
                   ['/workflow', hs.helpCmds.workflow],
+                  ['/workflow diagram', hs.helpCmds.diagram],
                   ['/workflow help', hs.helpCmds.help],
                   ['/workflow-demo', hs.helpCmds.demo],
                   ['/workflow export', hs.helpCmds.export],
@@ -1435,7 +1583,7 @@ export const register: Register = (on, options) => {
                 ] as const
               ).map(([k, v]) => (
                 <Box key={`cmd-${k}`} flexDirection="row" gap={SPACE.GAP}>
-                  <Box width={16} flexShrink={0}>
+                  <Box width={18} flexShrink={0}>
                     <Text>{k}</Text>
                   </Box>
                   <Box flexShrink={1}>
@@ -1447,14 +1595,15 @@ export const register: Register = (on, options) => {
               )),
             ])
           : null}
-        {sections.map(sec => [
+        {diagram ? diagramView : null}
+        {(diagram ? [] : sections).map(sec => [
           <Box key={`sec:${sec.key}`} marginTop={SPACE.GAP} flexDirection="row" alignItems="center">
             {sec.toggle ? btn(sec.toggle.key, Svg ? sec.label : `${sec.toggle.open ? '▾' : '▸'} ${sec.label}`, sec.toggle.onPress) : <Text dimColor>{sec.label}</Text>}
             {sec.toggle && Svg ? <Svg source={chevronPic(sec.toggle.open, T).source} alt={sec.toggle.open ? t.collapseTip : t.expandTip} width={14} height={20} /> : null}
           </Box>,
           ...sec.cards.map(c => stageCard(c, sec.key === 'done')),
         ])}
-        {plansOpen && !foreign
+        {plansOpen && !readOnly
           ? card('plans', [
               line('head', iconCol(undefined, false, ''), <Text bold>{t.plans}</Text>),
               plans.length === 0 ? line('empty', iconCol(undefined, false, ''), <Text dimColor>{t.noPlansHere}</Text>) : null,
@@ -1485,7 +1634,7 @@ export const register: Register = (on, options) => {
               ]),
             ])
           : null}
-        {projectsOpen
+        {projectsOpen && !beforeId
           ? card('projects', [
               line('head', iconCol(undefined, false, ''), <Text bold>{t.projects}</Text>),
               projects.length === 0 ? line('empty', iconCol(undefined, false, ''), <Text dimColor>{t.projectsEmpty}</Text>) : null,
@@ -1522,7 +1671,22 @@ export const register: Register = (on, options) => {
               ),
             ])
           : null}
-        {historyOpen && !foreign
+        {timelineOpen && !readOnly
+          ? card('timeline', [
+              line('head', iconCol(undefined, false, ''), <Text bold>{t.timelineBtn}</Text>),
+              events.length === 0 ? line('empty', iconCol(undefined, false, ''), <Text dimColor>{t.timelineEmpty}</Text>) : null,
+              events.length > TIMELINE_MAX ? line('earlier', iconCol(undefined, false, ''), <Text dimColor>{t.tlEarlier(events.length - TIMELINE_MAX)}</Text>) : null,
+              ...events.slice(-TIMELINE_MAX).map((ev, i) =>
+                line(
+                  `tl${i}`,
+                  iconCol(undefined, false, ''),
+                  fixed('at', fmtTime(ev.at), undefined, true),
+                  shrink('text', <Text wrap="truncate-end">{ev.text}</Text>),
+                ),
+              ),
+            ])
+          : null}
+        {historyOpen && !readOnly
           ? card('history', [
               line('head', iconCol(undefined, false, ''), <Text bold>{t.history}</Text>),
               history.length === 0 ? line('empty', iconCol(undefined, false, ''), <Text dimColor>{t.historyEmpty}</Text>) : null,
@@ -1574,6 +1738,35 @@ async function exportPlan($: $, surface?: UiPressArgument['surface']): Promise<s
   await $.fs.write(`${(await $.session.root()).replace(/[\\/]+$/, '')}/${EXPORT_FILE}`, md)
   await $.ui.copy({ text: md, ...(surface ? { surface } : {}) }).catch(() => undefined)
   return STR[lang].exported(EXPORT_FILE)
+}
+
+/** 插入前的計劃檔：步驟 id 以 encodeURIComponent 編碼（不會跳出資料夾） */
+const snapshotPath = async ($: $, planId: string, nodeId: string) => `${await rootOf($)}/${SNAP_DIR}/${planId}/${encodeURIComponent(nodeId)}.json`
+
+/**
+ * 插入某步驟之前的計劃：示範資料由目前的計劃拿走該次插入的步驟、並還原改過的依賴推算；
+ * 真資料讀 SNAP_DIR 的檔（壞檔、沒有檔 → undefined）。onlyCheck = 只看有沒有（不讀內容）。
+ */
+async function snapshotOf($: $, current: WorkflowMap, nodeId: string, onlyCheck = false): Promise<WorkflowMap | undefined> {
+  const node = current.nodes.find(n => n.id === nodeId)
+  if (await read($, DEMO)) {
+    if (!node?.impact) return undefined
+    const gone = new Set(node.impact.added)
+    return {
+      ...current,
+      nodes: current.nodes.filter(n => !gone.has(n.id)).map(n => ({ ...n, deps: n.deps.filter(d => !gone.has(d)) })),
+    }
+  }
+  const planId = await read($, BOUND)
+  if (!planId) return undefined
+  try {
+    const path = await snapshotPath($, planId, nodeId)
+    if (onlyCheck) return (await $.fs.exists(path)) ? current : undefined
+    const v = validateMap((JSON.parse(await $.fs.read(path)) as { map?: unknown }).map)
+    return typeof v === 'string' ? undefined : v
+  } catch {
+    return undefined
+  }
 }
 
 const undoPath = async ($: $, planId: string) => `${(await $.session.root()).replace(/[\\/]+$/, '')}/${UNDO_DIR}/${planId}.json`
@@ -1706,6 +1899,10 @@ export async function applyAndWrite($: $, op: Op, by?: string, fromAgent = false
     const merged = await writeMerged($, planId, base, r.map)
     if (typeof merged === 'string') return { error: merged }
     final = merged
+    // 插入：記下插入前的計劃（每個插入的步驟一份；失敗不影響這次寫入）
+    if (op.op === 'insert')
+      for (const n of op.nodes)
+        await $.fs.write(await snapshotPath($, planId, n.id), `${JSON.stringify({ version: 1, at: now, note: op.note, map: base })}\n`).catch(() => undefined)
     await update($, MAP, () => final)
     await foldAll($)
     await notifyTransitions($, base, final, fromAgent)

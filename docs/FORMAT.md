@@ -13,6 +13,7 @@ Since 0.3.1 every Claude Code **session has its own plan**: two sessions in the 
 | `.claude/workflow-map.history/<timestamp>-<slug>.json` | One archived plan per file, same shape plus `archivedAt`. `<timestamp>` is the ISO time with `:` and `.` replaced by `-`, so names sort by time. |
 | `.claude/workflow-map/plans/<planId>.v1-backup-<timestamp>.json` | The original text of a version 1 plan file, saved once before it was migrated (the legacy file is never migrated on disk). |
 | `.claude/workflow-map/plans/<planId>.bad-<timestamp>.json` | A plan file that could not be parsed, saved before the plan restarted empty (the legacy file is never rewritten). |
+| `.claude/workflow-map/snapshots/<planId>/<nodeId>.json` | The plan as it was just **before** the user's mid-plan request that added step `<nodeId>` (`{ version: 1, at, note, map }`), written once at `insert` time, so Details can show "Plan before this request". `<nodeId>` is URL-encoded. One file per inserted step, not limited like undo. The plugin API cannot delete files, so these stay after the plan is archived (they are small and keyed by plan id). |
 | `.claude/workflow-map/undo/<planId>.json` | Up to 10 earlier versions of that plan, newest last (`{ version: 1, snapshots: [{ at, label, map }] }`), for `/workflow undo`. An undo is applied as a new write, so it merges like any other change. |
 | `.claude/workflow-map.export.md` | The plan as Markdown, written only by `/workflow export` or the Export button. |
 
@@ -70,14 +71,24 @@ Unknown fields are preserved. A writer must copy through any field it does not u
 | `status` | `todo` · `doing` · `done` · `blocked` · `dropped` | `dropped` steps are hidden and not counted. |
 | `deps` | string[] | Ids that must finish first. Every id must exist, and the graph must have no cycles. |
 | `owner` | string, optional | Who does the step: an agent type or name, `"me"`, … |
+| `lane` | string, optional | A group name. Steps with the same `lane` are drawn as one box in the diagram view (title = the lane, with a count); arrows between groups attach to the box. |
+| `kind` | `step` · `decision` · `note`, optional | How the diagram draws it: `step` (default, omitted), `decision` (a dashed box with a question), `note` (an amber box: a warning, **not a step** — it is not counted, never ready and never blocks a step that depends on it). Readers that do not know a value should draw it as a step. |
+| `edgeLabel` | string, optional | A short label for what leads into this step, shown in the diagram as a "via …" caption under the step (or under its group's title; the distinct labels of a group are joined with ` · `). |
 | `note` | string, optional | A short remark. |
 | `inserted` | `{ at, by: "user", note }`, optional | Work the user asked for mid-plan; `note` is their words. |
+| `impact` | `{ added, rewired, downstream }`, optional | Set on inserted steps at `insert` time: `added` = the step ids that insert created, `rewired` = existing steps changed to wait for them (`before`), `downstream` = every step not done that now waits for them, directly or through other steps. A record of that moment; it is not recomputed. |
 | `updatedAt` | ISO string | When the node last changed. **Set it whenever you change a node.** |
 | `startedAt` | ISO string, optional | The first time the status became `doing`. |
 | `doneAt` | ISO string, optional | When the status became `done`; removed if the step is reopened. |
 | `log` | array of `{ at, status, by? }`, optional | Status changes, oldest first, at most 10 entries. |
 
 Two steps run in parallel when neither depends on the other, directly or through other steps.
+
+The fields `lane`, `kind`, `edgeLabel` and `impact` were added in 0.5.0 within `schemaVersion` 2: older readers ignore them (and must copy them through), and plans without them look the same as before.
+
+### Timeline
+
+There is no separate event log. The Timeline (full view and `/workflow export`) is built from what the file already holds: the plan's `createdAt`, each step's `log` (its first entry = when it was added; later entries = status changes with `by`; `by: "undo"` = an undo), and `inserted` (the user's words). Steps keep at most 10 log entries, so very old changes of a busy step drop out.
 
 ## Writing safely (merge rules)
 

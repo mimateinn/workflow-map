@@ -1,5 +1,8 @@
 export type WorkflowStatus = 'todo' | 'doing' | 'done' | 'blocked' | 'dropped'
 
+/** 插入的影響：added = 這次插入的步驟 id；rewired = 改為要等它的步驟（before）；downstream = 因此要等的全部未完成後續步驟 */
+export type InsertImpact = { added: string[]; rewired: string[]; downstream: string[] }
+
 /** 一次狀態變化（最多保留 10 筆） */
 export type NodeLogEntry = { at: string; status: WorkflowStatus; by?: string }
 
@@ -8,9 +11,16 @@ export type WorkflowNode = {
   title: string
   status: WorkflowStatus
   deps: string[]
+  /** 組：同一個 lane 的步驟在流程圖畫成一個容器（標題 = lane） */
   lane?: string
+  /** 流程圖的形狀：step（預設）、decision（虛線框的問題）、note（琥珀框的提醒，不算一步） */
+  kind?: 'step' | 'decision' | 'note'
+  /** 流程圖上指向這一步（或它的組）的線的小標籤 */
+  edgeLabel?: string
   /** 用戶中途插入的工作：時間、來源、內容 */
   inserted?: { at: string; by: 'user'; note: string }
+  /** 插入時對計劃的影響（插入當刻計算）：新增的步驟、改為要等它的步驟、因此要等的全部後續步驟 */
+  impact?: InsertImpact
   note?: string
   /** 誰負責（自由文字：Builder、Grok、me…） */
   owner?: string
@@ -63,8 +73,14 @@ declare module 'claude-code' {
       pending: boolean
       /** 全部完成後經過的輪數（≥ 2 即隱藏） */
       doneTurns: number
-      /** /workflow-demo 開啟時顯示示範資料（只在記憶體） */
-      demo: boolean
+      /** /workflow-demo 開啟時顯示示範資料（只在記憶體）：'' = 關、basic、team（流程圖示範） */
+      demo: '' | 'basic' | 'team'
+      /** 全圖面板顯示流程圖（而不是階段卡）；本 session 記住 */
+      diagram: boolean
+      /** 全圖面板正在看「插入前的計劃」的插入步驟 id（'' = 沒有） */
+      before: string
+      /** 全圖面板「時間線」是否展開 */
+      timelineOpen: boolean
       /** 全圖面板「已完成」一欄是否展開 */
       doneOpen: boolean
       /** 全圖面板「較遠的未來」是否展開 */

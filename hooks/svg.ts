@@ -3,7 +3,7 @@
 // 全圖 = GitLab 式階段卡，由上而下。數字一律是 SVG 內的文字，不是按鈕。
 // Svg 以圖片繪製讀不到 app 主題：色板分深／淺兩套，由 register 按 /config 的 theme 選。
 import type { WorkflowMap, WorkflowNode } from '../types/index'
-import { allDone, columns, elapsedMin, fmtTime, isStale, readyIds, stats } from './graph'
+import { allDone, columns, elapsedMin, fmtTime, impactText, insertedHot, insertedMarked, isStale, isStep, readyIds, stats } from './graph'
 import type { StageView } from './graph'
 import { STR } from './i18n'
 import type { Lang } from './i18n'
@@ -18,15 +18,17 @@ export type Theme = {
   run: string
   block: string
   ins: string
+  /** 流程圖的線（不透明：幾條線合併重疊時不會越疊越亮） */
+  wire: string
 }
 
 /** 淺色版 = 深色版每個色板通道 × 0.55（約暗 45%） */
 const darken = (hex: string) =>
   `#${[1, 3, 5].map(i => Math.round(parseInt(hex.slice(i, i + 2), 16) * 0.55).toString(16).padStart(2, '0')).join('')}`
-const DARK: Theme = { ink: '#ffffff', text: '#e6e6e3', dim: '#a3a3a0', done: '#3fa66b', run: '#d97757', block: '#d9962b', ins: '#a78bfa' }
+const DARK: Theme = { ink: '#ffffff', text: '#e6e6e3', dim: '#a3a3a0', done: '#3fa66b', run: '#d97757', block: '#d9962b', ins: '#a78bfa', wire: '#6e6e6c' }
 export const THEMES: Record<'dark' | 'light', Theme> = {
   dark: DARK,
-  light: { ink: '#000000', text: '#1f1f1f', dim: '#5e5e5b', done: darken(DARK.done), run: darken(DARK.run), block: darken(DARK.block), ins: darken(DARK.ins) },
+  light: { ink: '#000000', text: '#1f1f1f', dim: '#5e5e5b', done: darken(DARK.done), run: darken(DARK.run), block: darken(DARK.block), ins: darken(DARK.ins), wire: '#a8a8a5' },
 }
 
 /** 桌面版一格約多少 px（types 沒有提供；寧小勿大：放得下好過跑出邊界） */
@@ -46,14 +48,14 @@ const css = (T: Theme, motion = true) =>
   '</style>'
 
 export type Pic = { source: string; width: number; height: number }
-const doc = (w: number, h: number, T: Theme, body: string): Pic => {
+export const doc = (w: number, h: number, T: Theme, body: string): Pic => {
   const width = Math.max(1, Math.ceil(w))
   const height = Math.max(1, Math.ceil(h))
   return { source: `<svg xmlns='http://www.w3.org/2000/svg' width='${width}' height='${height}' viewBox='0 0 ${width} ${height}'>${css(T, body.includes("class='p'"))}${body}</svg>`, width, height }
 }
 
-const esc = (s: string) => s.replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`)
-const r1 = (n: number) => Math.round(n * 10) / 10
+export const esc = (s: string) => s.replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`)
+export const r1 = (n: number) => Math.round(n * 10) / 10
 const WIDE = /[⺀-鿿가-힯豈-﫿︰-﹏＀-｠￠-￦]/
 
 /** 估算文字闊度（px）：CJK = 1em；拉丁字按字形粗分（系統無襯線字體）。 */
@@ -82,14 +84,21 @@ export function fit(s: string, size: number, maxPx: number): string {
  * 文字。fixed = 估算闊度，用 textLength（只調字距）鎖死，後面接的東西位置就準；
  * 右對齊用 text-anchor，不需估算。
  */
-function text(x: number, y: number, s: string, cls = '', o: { size?: number; fixed?: boolean; end?: boolean } = {}): string {
+export function text(x: number, y: number, s: string, cls = '', o: { size?: number; fixed?: boolean; end?: boolean } = {}): string {
   if (!s) return ''
   const len = o.fixed ? ` textLength='${tw(s, o.size ?? (cls.includes('m') ? 11 : 12))}' lengthAdjust='spacing'` : ''
   return `<text x='${r1(x)}' y='${r1(y)}'${cls ? ` class='${cls}'` : ''}${o.end ? " text-anchor='end'" : ''}${len}>${esc(s)}</text>`
 }
 
-/** 畫面當下的時間與「久未更新」門檻（分鐘，0 = 不檢查） */
-export type Clock = { now: number; staleMin: number }
+/** 畫面當下的時間、「久未更新」門檻（分鐘，0 = 不檢查）、本輪開始的時間（插入的步驟只在本輪用紫色） */
+export type Clock = { now: number; staleMin: number; turnAt?: number }
+
+/** 紫色 ◇（本輪插入或本輪完成的插入步驟） */
+export const insHot = (n: WorkflowNode, c: Clock) => insertedHot(n, c.turnAt)
+/** 標題前的淡色 ◇（舊輪插入、仍未完成） */
+export const insMark = (n: WorkflowNode, c: Clock) => insertedMarked(n, c.turnAt)
+/** 標題前加淡色記號的寬度（px，12px 字） */
+const MARK_W = 13
 const NO_CLOCK: Clock = { now: 0, staleMin: 0 }
 
 export type Kind = 'done' | 'doing' | 'stale' | 'ready' | 'todo' | 'blocked'
@@ -142,7 +151,7 @@ export function icon(k: Kind, ins: boolean, cx: number, cy: number, T: Theme): s
   return `<circle cx='${f(cx)}' cy='${f(cy)}' r='5.25' fill='none' stroke='${T.ink}' stroke-opacity='${op}' stroke-width='1.5'/>`
 }
 
-const live = (map: WorkflowMap) => columns(map.nodes.filter(n => n.status !== 'dropped')).flat()
+const live = (map: WorkflowMap) => columns(map.nodes.filter(isStep)).flat()
 
 /**
  * 分段進度條：每步一段（已完成 → 進行中 → 受阻 → 未開始）；段太窄時同狀態併成一段。
@@ -200,7 +209,7 @@ export function headline(map: WorkflowMap, view: StageView, lang: Lang, c: Clock
   const next = [...first.filter(n => n !== lead && n.status !== 'doing' && ready.has(n.id)), ...(view.levels[1] ?? [])]
     .filter(n => n.status !== 'blocked')
     .map(n => n.title)
-  return { k: kindOf(lead, ready, c), ins: !!lead.inserted, name: lead.title, plus: Math.max(0, doing.length - 1), next }
+  return { k: kindOf(lead, ready, c), ins: insHot(lead, c), name: `${insMark(lead, c) ? '◇ ' : ''}${lead.title}`, plus: Math.max(0, doing.length - 1), next }
 }
 
 const ROW_H = 24
@@ -269,7 +278,7 @@ export function bandHeader(map: WorkflowMap, view: StageView, lang: Lang, T: The
 
 // ---------------- 展開：GitHub Actions 式卡片 ----------------
 
-type CardRow = { k?: Kind; ins?: boolean; label: string; cls?: string; meta?: string }
+type CardRow = { k?: Kind; ins?: boolean; mark?: boolean; label: string; cls?: string; meta?: string }
 type Card = { rows: CardRow[]; w: number; hot: boolean }
 
 const CARD_ROW = 18
@@ -278,7 +287,7 @@ const MAX_LABEL = 150
 
 function card(rows: CardRow[], hot: boolean): Card {
   const fitted = rows.map(r => ({ ...r, label: fit(r.label, 12, MAX_LABEL), meta: r.meta ? fit(r.meta, 11, 80) : '' }))
-  const w = Math.max(...fitted.map(r => (r.k ? LABEL_X : 10) + tw(r.label) + (r.meta ? 6 + tw(r.meta, 11) : 0) + 10))
+  const w = Math.max(...fitted.map(r => (r.k ? LABEL_X : 10) + (r.mark ? MARK_W : 0) + tw(r.label) + (r.meta ? 6 + tw(r.meta, 11) : 0) + 10))
   return { rows: fitted, w, hot }
 }
 
@@ -323,8 +332,10 @@ export function bandGraph(map: WorkflowMap, view: StageView, lang: Lang, T: Them
       const cy = 0.5 + 1 + j * CARD_ROW + CARD_ROW / 2
       if (r.k) parts.push(icon(r.k, !!r.ins, x + ICON_X, cy, T))
       // textLength 只在後面還有字時才用（否則估算誤差會把字距拉開）
-      parts.push(text(x + (r.k ? LABEL_X : 10), cy + 4, r.label, r.cls ?? '', { fixed: !!r.meta }))
-      if (r.meta) parts.push(text(x + (r.k ? LABEL_X : 10) + tw(r.label) + 6, cy + 4, r.meta, 'm', { fixed: true }))
+      const lx = x + (r.k ? LABEL_X : 10) + (r.mark ? MARK_W : 0)
+      if (r.mark) parts.push(text(lx - MARK_W, cy + 4, '◇', 'm'))
+      parts.push(text(lx, cy + 4, r.label, r.cls ?? '', { fixed: !!r.meta }))
+      if (r.meta) parts.push(text(lx + tw(r.label) + 6, cy + 4, r.meta, 'm', { fixed: true }))
     })
     return h + 1
   }
@@ -334,7 +345,7 @@ export function bandGraph(map: WorkflowMap, view: StageView, lang: Lang, T: Them
   // 中間各層的卡：放得下多少就畫多少（左右兩張小卡的位先留起）
   const levelCards = view.levels.map(lv => {
     const shown = lv.length > 3 ? lv.slice(0, 2) : lv
-    const cr: CardRow[] = shown.map(n => ({ k: kindOf(n, ready, clk), ins: !!n.inserted, label: n.title, meta: metaOf(n, lang, clk) }))
+    const cr: CardRow[] = shown.map(n => ({ k: kindOf(n, ready, clk), ins: insHot(n, clk), mark: insMark(n, clk), label: n.title, meta: metaOf(n, lang, clk) }))
     if (lv.length > 3) cr.push({ label: t.moreRows(lv.length - 2), cls: 'd' })
     return { c: card(cr, lv.some(n => n.status === 'doing')), steps: lv }
   })
@@ -385,7 +396,7 @@ export function bandGraph(map: WorkflowMap, view: StageView, lang: Lang, T: Them
   // 右：虛線 + 「+N 稍後」幽靈卡
   let ghost: Pic | undefined
   if (hidden.length) {
-    const ins = hidden.some(n => n.inserted)
+    const ins = hidden.some(n => insHot(n, clk))
     const gc = card([{ k: ins ? 'todo' : undefined, ins, label: t.laterCard(hidden.length), cls: 'd' }], false)
     // 虛線只在左邊有卡時畫
     const gx = placed.length || doneCard ? CARD_GAP - 3 : 0
@@ -455,6 +466,9 @@ export function paneStatus(map: WorkflowMap, lang: Lang): string {
 export type PaneRow = {
   n: WorkflowNode
   k: Kind
+  /** 紫色 ◇（本輪插入／完成）；mark = 舊輪插入、未完成：一般樣式 + 標題前淡色 ◇ */
+  ins: boolean
+  mark: boolean
   /** 右邊的狀態字與顏色（主題色名稱）；空 = 不顯示 */
   status: string
   statusColor?: 'claude' | 'warning'
@@ -473,16 +487,16 @@ export function paneCards(map: WorkflowMap, view: StageView, o: { lang: Lang; do
   const byId = new Map(map.nodes.map(n => [n.id, n]))
   const row = (n: WorkflowNode): PaneRow => {
     const k = kindOf(n, ready, c)
-    const waiting = n.deps.map(d => byId.get(d)).filter((d): d is WorkflowNode => !!d && d.status !== 'done' && d.status !== 'dropped')
+    const waiting = n.deps.map(d => byId.get(d)).filter((d): d is WorkflowNode => !!d && isStep(d) && d.status !== 'done')
     const sub = [
-      n.inserted ? [fmtTime(n.inserted.at), n.inserted.note].filter(Boolean).join(' · ') : '',
+      n.inserted && (insHot(n, c) || insMark(n, c)) ? [fmtTime(n.inserted.at), n.inserted.note].filter(Boolean).join(' · ') : '',
       (k === 'todo' || k === 'blocked') && waiting.length ? `← ${t.waitShort(waiting.map(d => d.title).join(t.list))}` : '',
     ]
       .filter(Boolean)
       .join(' · ')
     const status = k === 'doing' ? t.status.doing : k === 'stale' ? t.stale : k === 'blocked' ? t.status.blocked : k === 'ready' ? t.ready : ''
     const statusColor = k === 'doing' ? 'claude' : k === 'blocked' || k === 'stale' ? 'warning' : undefined
-    return { n, k, status, statusColor, info: metaOf(n, o.lang, c), sub }
+    return { n, k, ins: insHot(n, c), mark: insMark(n, c), status, statusColor, info: metaOf(n, o.lang, c), sub }
   }
   const cards: PaneCard[] = []
   if (view.done.length) {
@@ -504,6 +518,7 @@ export function detailLines(map: WorkflowMap, n: WorkflowNode, lang: Lang, c: Cl
   const log = (n.log ?? []).slice(-5).map(e => `${fmtTime(e.at).slice(6)} ${t.status[e.status]}${e.by ? ` (${e.by})` : ''}`)
   return [
     n.inserted ? `${t.dWords}${n.inserted.note}${fmtTime(n.inserted.at) ? ` (${fmtTime(n.inserted.at)})` : ''}` : '',
+    impactText(map, n, lang),
     n.deps.length ? `${t.dWaits}${n.deps.map(d => byId.get(d)?.title ?? d).join(t.list)}` : '',
     after.length ? `${t.dUnblocks}${after.join(t.list)}` : '',
     n.owner ? `${t.dOwner}${n.owner}` : '',

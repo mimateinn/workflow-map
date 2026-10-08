@@ -6,12 +6,12 @@
  * 線只畫在兩端都有卡時（沒有懸空的線）。
  */
 import type { WorkflowMap, WorkflowNode } from '../types/index'
-import { columns, readyIds } from './graph'
+import { columns, isStep, readyIds } from './graph'
 import type { StageView } from './graph'
 import { STR } from './i18n'
 import type { Lang } from './i18n'
 import { cells, fitCells } from './suggest'
-import { headline, kindOf, metaOf } from './svg'
+import { headline, insHot, insMark, kindOf, metaOf } from './svg'
 import type { Clock, Kind } from './svg'
 
 /** 一段字；color 是主題鍵 */
@@ -40,7 +40,7 @@ const paint = (s: WorkflowNode['status']) => (s === 'done' ? 'success' : s === '
  */
 export function barSegs(map: WorkflowMap, width: number): Seg[] {
   const order = { done: 0, doing: 1, blocked: 2, todo: 3, dropped: 4 } as const
-  const steps = columns(map.nodes.filter(n => n.status !== 'dropped'))
+  const steps = columns(map.nodes.filter(isStep))
     .flat()
     .sort((a, b) => order[a.status] - order[b.status])
   const n = steps.length
@@ -72,7 +72,7 @@ export function barSegs(map: WorkflowMap, width: number): Seg[] {
 export function headerSegs(map: WorkflowMap, view: StageView, lang: Lang, clk: Clock, cols: number, pending: boolean, eta: string) {
   const t = STR[lang]
   const h = headline(map, view, lang, clk)
-  const s = map.nodes.filter(n => n.status !== 'dropped')
+  const s = map.nodes.filter(isStep)
   const count = `${s.filter(n => n.status === 'done').length}/${s.length}`
   const tail: Seg[] = [{ text: ' ' }, { text: count, bold: true }, ...(eta ? [{ text: ` ${eta}`, dim: true }] : []), ...(pending ? [{ text: ' ●', color: 'warning' }] : [])]
   const name = fitCells(h.name, Math.max(8, Math.floor(cols * 0.4)))
@@ -131,12 +131,12 @@ export function bandCards(map: WorkflowMap, view: StageView, lang: Lang, clk: Cl
   const stepRow = (n: WorkflowNode, titleW: number): Seg[] => {
     const k = kindOf(n, ready, clk)
     const meta = fitCells(metaOf(n, lang, clk), 16)
-    const title = fitCells(n.title, 22)
-    return [glyph(k, !!n.inserted), { text: ' ' }, { text: meta ? title + ' '.repeat(titleW - cells(title)) : title, dim: k === 'todo' }, ...(meta ? [{ text: `  ${meta}`, dim: true }] : [])]
+    const title = fitCells(`${insMark(n, clk) ? '◇ ' : ''}${n.title}`, 22)
+    return [glyph(k, insHot(n, clk)), { text: ' ' }, { text: meta ? title + ' '.repeat(titleW - cells(title)) : title, dim: k === 'todo' }, ...(meta ? [{ text: `  ${meta}`, dim: true }] : [])]
   }
   const levels = view.levels.map(lv => {
     const shown = lv.length > 3 ? lv.slice(0, 2) : lv
-    const titleW = Math.max(...shown.map(n => cells(fitCells(n.title, 22))))
+    const titleW = Math.max(...shown.map(n => cells(fitCells(`${insMark(n, clk) ? '◇ ' : ''}${n.title}`, 22))))
     const rows = shown.map(n => stepRow(n, titleW))
     if (lv.length > 3) rows.push([{ text: '  ' }, { text: t.moreRows(lv.length - 2), dim: true }])
     return { c: tcard(rows, lv.some(n => n.status === 'doing')), steps: lv }

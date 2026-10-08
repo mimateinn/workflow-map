@@ -2,10 +2,11 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { applyOp, columns, DONE_ID, elapsedMin, emptyMap, etaMin, exportMarkdown, findCycle, focusedMap, focusSet, isStale, mergeMaps, migrate, MORE_ID, plainLines, readyIds, stageView, textDiagram } from '../hooks/graph'
+import { applyOp, columns, DONE_ID, downstreamOf, elapsedMin, emptyMap, etaMin, exportMarkdown, findCycle, focusedMap, focusSet, isStale, mergeMaps, migrate, MORE_ID, plainLines, readyIds, stageView, stats, textDiagram, timeline, validateMap } from '../hooks/graph'
 import { detectLang, looksLikeRequest, resolveLang } from '../hooks/i18n'
-import { metaOf, THEMES } from '../hooks/svg'
-import { demoMap } from '../hooks/demo'
+import { bandGraph, detailLines, metaOf, THEMES } from '../hooks/svg'
+import { demoMap, teamMap } from '../hooks/demo'
+import { flowOutline, flowStructure, flowSvg, layoutFlow, packChains } from '../hooks/flow'
 import type { WorkflowMap } from '../types/index'
 
 const TOOL = 'mcp__workflow-map__workflow_map'
@@ -1359,7 +1360,8 @@ describe('auto plan (the plugin itself keeps Claude on the plan)', () => {
     await $.session.start(START)
     const text = (await guide($)) ?? ''
     for (const s of ['3+ steps', 'new_plan', 'doing', 'done or blocked', 'insert', 'BEFORE acting', '[wm:<step id>]', "user's language"]) expect(text).toContain(s)
-    expect(text.split(/\s+/).length).toBeLessThanOrEqual(110)
+    expect(text.split(/\s+/).length).toBeLessThanOrEqual(120)
+    for (const s of ['lane', 'edgeLabel']) expect(text).toContain(s)
     expect(await guide($, [])).toBeUndefined()
   })
 
@@ -1726,5 +1728,497 @@ describe('band popovers (hover lists)', () => {
     expect(keys.filter(k => k.startsWith('stage:')).length).toBeGreaterThan(3)
     expect(keys).toContain('done')
     await pane.unmount()
+  })
+})
+
+// ---------------- 0.5.0：流程圖、插入的影響、插入前的計劃、時間線、紫色只限本輪 ----------------
+
+type Box2 = { x: number; y: number; w: number; h: number }
+const overlaps = (a: Box2, b: Box2) => a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h
+/** 直角線段穿過矩形內部（只碰到邊不算） */
+const crosses = (p: readonly [number, number], q: readonly [number, number], r: Box2) =>
+  Math.min(p[0], q[0]) < r.x + r.w && Math.max(p[0], q[0]) > r.x && Math.min(p[1], q[1]) < r.y + r.h && Math.max(p[1], q[1]) > r.y
+const cellsW = (x: string) => [...x].reduce((n, c) => n + (/[⺀-鿿가-힯豈-﫿︰-﹏＀-｠￠-￦]/.test(c) ? 2 : 1), 0)
+const PANE = (cols: number, surface: 'desktop' | 'terminal' = 'desktop') =>
+  ({ plugin: 'workflow-map', surface, component: 'Pane', requestId: 'workflow-map', props: { title: 'x', isFocused: false, bodyColumns: cols } }) as never
+
+describe('diagram view: layout (stage rows + one bus between rows)', () => {
+  const T0 = Date.parse(NOW)
+  const clk = { now: T0, staleMin: 30 }
+  const mid = (u: Box2) => Math.round(u.x + u.w / 2)
+
+  test('one box per lane; links between boxes collapse to one; a lane cycle becomes a "waits for" chip, never a line upward; pairs form chains', () => {
+    const m = ok(
+      applyOp(
+        emptyMap(),
+        {
+          op: 'set_plan',
+          nodes: [
+            { id: 'A', title: 'start' },
+            { id: 'x1', title: 'x1', lane: 'X', deps: ['A'] },
+            { id: 'x2', title: 'x2', lane: 'X', deps: ['A'] },
+            { id: 'x2t', title: 'x2 test', lane: 'X', deps: ['x2'] },
+            { id: 'y1', title: 'y1', lane: 'Y', deps: ['x1', 'x2'] },
+            { id: 'x3', title: 'x3', lane: 'X', deps: ['y1'] },
+          ],
+        },
+        NOW,
+      ),
+    )
+    const st = flowStructure(m)
+    expect(st.units.map(u => [u.id, u.members.length])).toEqual([
+      ['n:A', 1],
+      ['g:X', 4],
+      ['g:Y', 1],
+    ])
+    expect(st.units.find(u => u.id === 'g:X')!.chains).toEqual([['x1'], ['x2', 'x2t'], ['x3']])
+    expect(st.edges).toEqual([
+      { from: 'n:A', to: 'g:X', back: false },
+      { from: 'g:X', to: 'g:Y', back: false },
+      { from: 'g:Y', to: 'g:X', back: true },
+    ])
+    expect(st.layers).toEqual([['n:A'], ['g:X'], ['g:Y']])
+    const lay = layoutFlow(m, { width: 600, lang: 'en' })
+    expect(lay.units.find(u => u.id === 'g:X')!.waits).toEqual(['Y'])
+    expect(lay.buses.map(b => [b.ups.map(u => u.from), b.downs.map(d => d.to)])).toEqual([
+      [['n:A'], ['g:X']],
+      [['g:X'], ['g:Y']],
+    ])
+    expect(lay.stages.map(s => s.label)).toEqual(['Stage 1', 'Stage 2', 'Stage 3'])
+  })
+
+  for (const width of [320, 584, 884])
+    test(`team sample at ${width}px: inside the width, no overlaps, buses only between adjacent rows and never through a box, every other wait is a chip`, () => {
+      const map = teamMap(T0, 'zh-Hant')
+      const lay = layoutFlow(map, { width, lang: 'zh-Hant' })
+      expect(JSON.stringify(layoutFlow(teamMap(T0, 'zh-Hant'), { width, lang: 'zh-Hant' }))).toBe(JSON.stringify(lay))
+      expect(Object.fromEntries(lay.units.filter(u => u.group).map(u => [u.group!, u.members.length]))).toEqual({
+        共享核心: 2,
+        獨立覆核: 5,
+        '8 組：各自開發、模組接入、配對測試': 16,
+        機動補位: 3,
+        具體阻塞修復: 2,
+        官方來源核對: 2,
+      })
+      expect(lay.units.filter(u => !u.group).length).toBe(6)
+      for (const u of lay.units) {
+        expect(u.x).toBeGreaterThanOrEqual(lay.gut)
+        expect(u.x + u.w).toBeLessThanOrEqual(width)
+        for (const c of u.cells) expect(c.x >= u.x && c.y >= u.y && c.x + c.w <= u.x + u.w && c.y + c.h <= u.y + u.h).toBe(true)
+      }
+      for (const [i, a] of lay.units.entries()) for (const b of lay.units.slice(i + 1)) expect([a.id, b.id, overlaps(a, b)]).toEqual([a.id, b.id, false])
+      // 開發 n → 測試 n：同一行，測試緊接在右邊，中間一個短箭咀
+      const build = lay.units.find(u => u.members.includes('build1'))!
+      expect(build.links.length).toBe(8)
+      for (let i = 1; i <= 8; i++) {
+        const b = build.cells.find(c => c.id === `build${i}`)!
+        const t = build.cells.find(c => c.id === `test${i}`)!
+        expect([t.y, t.x - b.x]).toEqual([b.y, lay.cellW + 22])
+      }
+      // 每個階段一個淡色標籤
+      expect(lay.stages.length).toBe(flowStructure(map).layers.length)
+      // 匯流線：只連相鄰兩行；在兩行之間的空隙；上下短線由框邊開始／到框邊結束；全部線段不穿過任何框
+      const byId = new Map(lay.units.map(u => [u.id, u]))
+      expect(lay.buses.length).toBeGreaterThan(3)
+      for (const b of lay.buses) {
+        const r = new Set(b.ups.map(u => byId.get(u.from)!.row))
+        const r2 = new Set(b.downs.map(d => byId.get(d.to)!.row))
+        expect([r.size, r2.size, [...r2][0]! - [...r][0]!]).toEqual([1, 1, 1])
+        const row = [...r][0]!
+        expect(b.y).toBeGreaterThan(Math.max(...lay.units.filter(u => u.row === row).map(u => u.y + u.h)))
+        expect(b.y).toBeLessThan(Math.min(...lay.units.filter(u => u.row === row + 1).map(u => u.y)))
+        for (const u of b.ups) expect([u.x, u.y]).toEqual([mid(byId.get(u.from)!), byId.get(u.from)!.y + byId.get(u.from)!.h])
+        for (const d of b.downs) {
+          const u = byId.get(d.to)!
+          // 入口在框頂：中間，或對齊附近（≤ 12px）上面的短線
+          expect([d.y, Math.abs(d.x - mid(u)) <= 12, d.x >= u.x + 14 && d.x <= u.x + u.w - 14]).toEqual([u.y, true, true])
+        }
+        const segs: [readonly [number, number], readonly [number, number]][] = [
+          [[b.x1, b.y], [b.x2, b.y]],
+          ...b.ups.map(u => [[u.x, u.y], [u.x, b.y]] as [readonly [number, number], readonly [number, number]]),
+          ...b.downs.map(d => [[d.x, b.y], [d.x, d.y]] as [readonly [number, number], readonly [number, number]]),
+        ]
+        for (const [p, q] of segs) for (const u of lay.units) expect(crosses(p, q, u)).toBe(false)
+      }
+      // 每條依賴：要麼在匯流線上，要麼（前置未完成）是框內的「← 待」
+      const st = flowStructure(map)
+      const name = (id: string) => st.units.find(u => u.id === id)!.group ?? st.units.find(u => u.id === id)!.members[0]!.title
+      const done = (id: string) => st.units.find(u => u.id === id)!.members.every(m => m.status === 'done' || m.kind === 'note')
+      let chips = 0
+      for (const e of st.edges) {
+        if (lay.buses.some(b => b.ups.some(u => u.from === e.from) && b.downs.some(d => d.to === e.to))) continue
+        if (done(e.from)) continue
+        expect(byId.get(e.to)!.waits).toContain(name(e.from))
+        chips++
+      }
+      expect(chips).toBeGreaterThan(0)
+      // 「← 待」只列未完成的前置
+      for (const u of lay.units) for (const w of u.waits) expect(st.units.some(x => name(x.id) === w && !done(x.id))).toBe(true)
+      const pic = flowSvg(map, lay, 'zh-Hant', THEMES.dark, clk)
+      if (width >= 584) expect(pic.source).toContain('經：共用介面／解析入口')
+      expect(pic.source).toContain('← 待 ')
+      expect(pic.source.length).toBeLessThan(131072)
+      expect([pic.width, pic.height]).toEqual([width, lay.height])
+    })
+
+  test('packing inside a group: pairs keep their row, singles fill the free slots', () => {
+    const chains = [['a', 'a2'], ['b'], ['c', 'c2'], ['d']]
+    expect(packChains(chains, 3)).toEqual([
+      { chain: 0, row: 0, col: 0 },
+      { chain: 1, row: 0, col: 2 },
+      { chain: 2, row: 1, col: 0 },
+      { chain: 3, row: 1, col: 2 },
+    ])
+    expect(packChains(chains, 2)).toEqual([
+      { chain: 0, row: 0, col: 0 },
+      { chain: 2, row: 1, col: 0 },
+      { chain: 1, row: 2, col: 0 },
+      { chain: 3, row: 2, col: 1 },
+    ])
+    // 真的版面：一對 + 兩個單格，闊的時候一行排完（不留空位），窄的時候單格同一行
+    const m = ok(
+      applyOp(
+        emptyMap(),
+        {
+          op: 'set_plan',
+          nodes: [
+            { id: 's', title: 'Start' },
+            { id: 'p1', title: 'Palette', lane: 'UI', deps: ['s'] },
+            { id: 'p2', title: 'Icons', lane: 'UI', deps: ['p1'] },
+            { id: 'q', title: 'Toggle', lane: 'UI', deps: ['s'] },
+            { id: 'r', title: 'Login', lane: 'UI', deps: ['s'] },
+          ],
+        },
+        NOW,
+      ),
+    )
+    const rowsOf = (w: number) => {
+      const lay = layoutFlow(m, { width: w, lang: 'en' })
+      const g = lay.units.find(u => u.group === 'UI')!
+      const ys = [...new Set(g.cells.map(c => c.y))].sort((a, b) => a - b)
+      const pitch = lay.cellW + 22
+      // 每一行由同一個左邊開始、格與格之間一個間距（沒有空位）
+      for (const y of ys) {
+        const xs = g.cells.filter(c => c.y === y).map(c => c.x).sort((a, b) => a - b)
+        xs.forEach((x, i) => expect(x).toBe(g.x + 10 + i * pitch))
+      }
+      return ys.map(y => g.cells.filter(c => c.y === y).map(c => c.id).sort())
+    }
+    expect(rowsOf(900)).toEqual([['p1', 'p2', 'q', 'r']])
+    expect(rowsOf(320)).toEqual([
+      ['p1', 'p2'],
+      ['q', 'r'],
+    ])
+  })
+
+  test('a long "waits for" list is cut with … inside its box; the layout keeps every name', () => {
+    const m = ok(
+      applyOp(
+        emptyMap(),
+        {
+          op: 'set_plan',
+          nodes: [
+            { id: 's', title: 'Start' },
+            ...[1, 2, 3, 4, 5].map(i => ({ id: `a${i}`, title: `Long preparation step ${i}`, deps: ['s'] })),
+            { id: 'm', title: 'Middle', deps: ['a1'] },
+            { id: 'z', title: 'Finish', deps: ['a1', 'a2', 'a3', 'a4', 'a5', 'm'] },
+          ],
+        },
+        NOW,
+      ),
+    )
+    const lay = layoutFlow(m, { width: 360, lang: 'en' })
+    const z = lay.units.find(u => u.id === 'n:z')!
+    expect(z.waits.length).toBe(5)
+    expect(z.w).toBeLessThanOrEqual(360 - lay.gut)
+    const svg = flowSvg(m, lay, 'en', THEMES.dark, clk).source
+    expect(svg).toMatch(/← waits for Long preparation step 1, [^<]*…</)
+  })
+
+  test('decision = dashed box, note = amber box on a dotted drop; edge labels become a "via" caption; a note is not a step and never blocks', () => {
+    const m = ok(
+      applyOp(
+        emptyMap(),
+        {
+          op: 'set_plan',
+          nodes: [
+            { id: 'q', title: 'Ship it?', kind: 'decision', status: 'done' },
+            { id: 'a', title: 'Build', deps: ['q'], edgeLabel: 'yes' },
+            { id: 'n', title: 'Watch the queue', kind: 'note', deps: ['q'] },
+            { id: 'b', title: 'After', deps: ['n'] },
+          ],
+        },
+        NOW,
+      ),
+    )
+    expect(stats(m)).toMatchObject({ done: 1, total: 3 })
+    expect([...readyIds(m.nodes)]).toEqual(['a', 'b'])
+    expect(stageView(m).levels.flat().map(n => n.id)).toEqual(['a', 'b'])
+    const svg = flowSvg(m, layoutFlow(m, { width: 500, lang: 'en' }), 'en', THEMES.dark, clk).source
+    expect(svg).toContain("stroke-dasharray='4 3'")
+    expect(svg).toContain(`stroke='${THEMES.dark.block}' stroke-opacity='.8'`)
+    expect(svg).toContain("stroke-dasharray='2 3'")
+    expect(svg).toContain('>via yes<')
+  })
+
+  test('terminal outline: a line per box with its count, A → B pairs, ↓ between layers, nothing wider than the pane', () => {
+    const map = teamMap(T0, 'zh-Hant')
+    const lines = flowOutline(map, 'zh-Hant', 48, clk).map(l => l.map(s => s.text).join(''))
+    for (const l of lines) expect(cellsW(l)).toBeLessThanOrEqual(48)
+    expect(lines.filter(l => l.trim() === '↓').length).toBe(flowStructure(map).layers.length - 1)
+    expect(lines).toContain('    ✓ 開發 1 → ✓ 測試 1')
+    expect(lines.some(l => l.startsWith('共享核心 · 2 個'))).toBe(true)
+    expect(lines.some(l => l.startsWith('※ 接線仍有排隊風險'))).toBe(true)
+  })
+})
+
+describe('diagram view: fields and tool', () => {
+  test('lane, kind and edgeLabel are kept; empty text clears them; a bad kind or a non-text lane is rejected', () => {
+    let m = ok(applyOp(emptyMap(), { op: 'set_plan', nodes: [{ id: 'a', title: 'A', lane: ' Review ', kind: 'decision', edgeLabel: 'if unsure' }] }, NOW))
+    expect(m.nodes[0]).toMatchObject({ lane: 'Review', kind: 'decision', edgeLabel: 'if unsure' })
+    m = ok(applyOp(m, { op: 'upsert', nodes: [{ id: 'a', lane: '', kind: 'step', edgeLabel: '' }] }, LATER))
+    expect(['lane', 'kind', 'edgeLabel'].filter(k => k in m.nodes[0]!)).toEqual([])
+    expect(applyOp(m, { op: 'upsert', nodes: [{ id: 'a', kind: 'diamond' as never }] }, LATER)).toEqual({ error: 'a: kind must be step/decision/note' })
+    expect('error' in applyOp(m, { op: 'upsert', nodes: [{ id: 'a', lane: 3 as never }] }, LATER)).toBe(true)
+    expect(validateMap({ nodes: [{ id: 'a', title: 'A', status: 'todo', deps: [], kind: 7 }] })).toBe('a.kind is invalid')
+    expect(textDiagram(ok(applyOp(m, { op: 'upsert', nodes: [{ id: 'a', lane: 'Review', kind: 'note' }] }, LATER)))).toContain('[note; lane: Review]')
+  })
+
+  test('the tool writes lane, kind and edgeLabel; a bad kind is denied and nothing is written', async ($, on) => {
+    const files: Record<string, string> = {}
+    world(on, files)
+    await $.session.start(START)
+    await $.tool.call({ tool: TOOL, op: 'new_plan', title: 'x', nodes: [{ id: 'a', title: 'A', lane: 'Review', kind: 'decision', edgeLabel: 'go' }] })
+    expect(cur(files).nodes[0]).toMatchObject({ lane: 'Review', kind: 'decision', edgeLabel: 'go' })
+    const before = JSON.stringify(files)
+    const r = await $.tool.call({ tool: TOOL, op: 'upsert', nodes: [{ id: 'a', kind: 'circle' }] })
+    expect(String(r.deny)).toContain('kind must be step/decision/note')
+    expect(JSON.stringify(files)).toBe(before)
+  })
+})
+
+describe('diagram view: pane', () => {
+  test('the Diagram button swaps the stage cards for one picture as wide as the pane (1:1) and back; /workflow diagram opens it', async ($, on) => {
+    world(on, {})
+    on('ui.open', () => ({ value: { isPlaced: true as const } }))
+    await $.session.start(START)
+    await $.command.run({ command: 'workflow-demo', args: '', origin: { kind: 'composer' } } as never)
+    const ui = await $.ui.mount(PANE(94))
+    const big = async () => (await ui.findAll({ type: 'Svg' })).filter(s => Number(s.props.height) > 20)
+    expect((await ui.find({ key: 'diagram' }))?.text).toBe('Diagram')
+    expect(await big()).toEqual([])
+    await ui.press({ key: 'diagram' })
+    const pics = await big()
+    expect(pics.length).toBe(1)
+    expect([pics[0]!.props.width, pics[0]!.props.isInteractive]).toEqual([Math.round(94 * 6.4) - 16, undefined])
+    expect(String(pics[0]!.props.alt)).toContain('Card layout')
+    expect((await ui.find({ key: 'diagram' }))?.text).toBe('Stages')
+    expect(await allText(ui)).not.toContain('Stage 1')
+    await ui.press({ key: 'diagram' })
+    expect(await big()).toEqual([])
+    expect(await allText(ui)).toContain('Stage 1')
+    await $.command.run({ command: 'workflow', args: 'diagram', origin: { kind: 'composer' } } as never)
+    expect((await big()).length).toBe(1)
+    await ui.unmount()
+  })
+
+  test('the toolbar (now 8 buttons) never squeezes a button: each keeps its width and the row wraps whole buttons', { options: { language: 'de' } }, async ($, on) => {
+    world(on, {})
+    await $.session.start(START)
+    await $.command.run({ command: 'workflow-demo', args: '', origin: { kind: 'composer' } } as never)
+    const ui = await $.ui.mount(PANE(50))
+    const row = (await ui.find({ key: 'tools' })) as unknown as { props: Record<string, unknown>; children: { props: Record<string, unknown> }[] }
+    expect([row.props.flexWrap, row.props.justifyContent]).toEqual(['wrap', 'flex-end'])
+    const boxes = row.children.filter(Boolean)
+    expect(boxes.length).toBe(8)
+    for (const b of boxes) expect(b.props.flexShrink).toBe(0)
+    expect((await ui.findAll({ type: 'Button' })).map(b => b.text).slice(0, 8)).toEqual(['Diagramm', 'Zeitleiste', 'Rückgängig', 'Exportieren', 'Verlauf', 'Pläne', 'Projekte', 'Hilfe'])
+    await ui.unmount()
+  })
+
+  test('/workflow-demo team shows the team sample as a diagram; the terminal draws the outline instead, no picture', async ($, on) => {
+    world(on, {})
+    await $.session.start(START)
+    const r = await $.command.run({ command: 'workflow-demo', args: 'team', origin: { kind: 'composer' } } as never)
+    expect(JSON.stringify(r)).toContain('team sample')
+    const ui = await $.ui.mount(PANE(140))
+    const svg = (await ui.findAll({ type: 'Svg' })).find(s => Number(s.props.height) > 20)
+    expect(String(svg?.props.source)).toContain('Independent review')
+    await ui.unmount()
+    const term = await $.ui.mount(PANE(60, 'terminal'))
+    const texts = (await term.findAll({ type: 'Text' })).map(x => x.text)
+    expect(texts).toContain('Independent review')
+    expect(texts.filter(x => x === '  ↓').length).toBeGreaterThan(3)
+    expect(await term.findAll({ type: 'Svg' })).toEqual([])
+    await term.unmount()
+  })
+})
+
+describe('mid-plan requests: impact, the plan before, timeline', () => {
+  test('insert records what it changed: the added steps, the steps rewired to wait (before) and every open step downstream', () => {
+    let m = ok(
+      applyOp(
+        emptyMap(),
+        {
+          op: 'set_plan',
+          nodes: [
+            { id: 'A', title: 'a', status: 'done' },
+            { id: 'B', title: 'b', deps: ['A'] },
+            { id: 'C', title: 'c', deps: ['B'] },
+            { id: 'D', title: 'd', deps: ['C'] },
+            { id: 'E', title: 'e', deps: ['A'] },
+            { id: 'F', title: 'f', deps: ['D'], status: 'done' },
+          ],
+        },
+        NOW,
+      ),
+    )
+    m = ok(applyOp(m, { op: 'insert', note: 'add a check', nodes: [{ id: 'X', title: 'x', deps: ['A'] }], before: ['C'] }, LATER))
+    const x = m.nodes.find(n => n.id === 'X')!
+    expect(x.impact).toEqual({ added: ['X'], rewired: ['C'], downstream: ['C', 'D'] })
+    expect(downstreamOf(m.nodes, ['B'])).toEqual(['C', 'D'])
+    expect(detailLines(m, x, 'en')).toContain('What changed: +1 step · 1 step now waits for this · 2 downstream (c, d)')
+    // set_plan 保留插入的影響
+    const again = ok(applyOp(m, { op: 'set_plan', nodes: m.nodes.map(({ id, title, deps, status }) => ({ id, title, deps, status })) }, LATER))
+    expect(again.nodes.find(n => n.id === 'X')!.impact).toEqual(x.impact)
+  })
+
+  test('insert saves the plan before it; Details shows the impact, marks the affected steps, and opens that plan read-only with Back', async ($, on) => {
+    const files: Record<string, string> = {}
+    world(on, files)
+    await $.session.start(START)
+    await $.tool.call({
+      tool: TOOL,
+      op: 'new_plan',
+      title: 'p',
+      nodes: [
+        { id: 'A', title: 'Alpha', status: 'doing' },
+        { id: 'B', title: 'Beta', deps: ['A'] },
+        { id: 'C', title: 'Gamma', deps: ['B'] },
+      ],
+    })
+    await $.tool.call({ tool: TOOL, op: 'insert', note: 'also lint', nodes: [{ id: 'L', title: 'Lint', deps: ['A'] }], before: ['B'] })
+    const planId = cur(files).planId
+    const snap = JSON.parse(files[`${ROOT}/.claude/workflow-map/snapshots/${planId}/L.json`]!)
+    expect(snap.note).toBe('also lint')
+    expect(snap.map.nodes.map((n: { id: string }) => n.id)).toEqual(['A', 'B', 'C'])
+    expect(snap.map.nodes[1].deps).toEqual(['A'])
+    const ui = await $.ui.mount(PANE(120))
+    await ui.press({ key: 'detail:L' })
+    let all = await allText(ui)
+    expect(all).toContain('What changed: +1 step · 1 step now waits for this · 2 downstream (Beta, Gamma)')
+    expect((await ui.findAll({ type: 'Text' })).filter(x => x.text === '•').map(x => x.props.color)).toEqual([THEMES.dark.ins, THEMES.dark.ins])
+    const written = JSON.stringify(files)
+    await ui.press({ key: 'before:L' })
+    all = await allText(ui)
+    for (const s of ['Plan before “Lint” was added (read-only)', '+ added: Lint', '~ now waits for it: Beta']) expect(all).toContain(s)
+    expect(all).not.toMatch(/^Lint$/m)
+    for (const k of ['undo', 'export', 'history', 'plans', 'timeline', 'projects']) expect(await ui.find({ key: k })).toBeUndefined()
+    expect(await ui.find({ key: 'diagram' })).toBeDefined()
+    expect(JSON.stringify(files)).toBe(written)
+    await ui.press({ key: 'before-back' })
+    expect(await allText(ui)).toMatch(/^Lint$/m)
+    await ui.unmount()
+  })
+
+  test('timeline in time order: started, added, the request in the user words, status changes with who, undo; export carries it and the impact', () => {
+    const t = (min: number) => new Date(Date.parse(NOW) + min * 60_000).toISOString()
+    let m = ok(applyOp(emptyMap(t(0), 'Dark mode'), { op: 'set_plan', nodes: [{ id: 'A', title: 'Alpha' }, { id: 'B', title: 'Beta', deps: ['A'] }] }, t(0)))
+    m = ok(applyOp(m, { op: 'status', id: 'A', status: 'doing' }, t(1), 'Builder'))
+    m = ok(applyOp(m, { op: 'insert', note: 'follow the system theme', nodes: [{ id: 'X', title: 'Theme' }], before: ['B'] }, t(2)))
+    m = ok(applyOp(m, { op: 'status', id: 'A', status: 'done' }, t(3), 'Builder'))
+    m = ok(applyOp(m, { op: 'restore', nodes: m.nodes.map(n => (n.id === 'A' ? { ...n, status: 'doing' as const } : n)) }, t(4), 'undo'))
+    expect(timeline(m, 'en').map(e => e.text)).toEqual([
+      'Plan started: Dark mode',
+      'Added: Alpha',
+      'Added: Beta',
+      'Alpha → In progress (Builder)',
+      '◇ Request “follow the system theme” → Theme',
+      'Alpha → Done (Builder)',
+      'Undo: Alpha → In progress',
+    ])
+    const md = exportMarkdown(m, 'en', Date.parse(t(5)))
+    expect(md).toContain('\n## Timeline\n')
+    expect(md.indexOf('Plan started: Dark mode')).toBeLessThan(md.indexOf('Undo: Alpha → In progress'))
+    expect(md).toContain('  - What changed: +1 step · 1 step now waits for this · 1 downstream (Beta)')
+  })
+
+  test('the Timeline button lists the events with their times, oldest first', async ($, on) => {
+    world(on, {})
+    await $.session.start(START)
+    await $.command.run({ command: 'workflow-demo', args: '', origin: { kind: 'composer' } } as never)
+    const ui = await $.ui.mount(PANE(120))
+    expect(await allText(ui)).not.toContain('Plan started')
+    await ui.press({ key: 'timeline' })
+    const all = await allText(ui)
+    expect(all.indexOf('Plan started')).toBeLessThan(all.indexOf('◇ Request “Follow the system light/dark” → Dark theme'))
+    expect(all).toContain('Gather needs → Done (me)')
+    expect((await ui.find({ key: 'timeline' }))?.text).toBe('Hide timeline')
+    await ui.unmount()
+  })
+})
+
+describe('inserted steps: violet only for this turn', () => {
+  const at = (min: number) => new Date(Date.parse(NOW) + min * 60_000).toISOString()
+  const ins = (min: number, note: string) => ({ at: at(min), by: 'user' as const, note })
+  const sample = () => ({
+    schemaVersion: 2,
+    version: 1,
+    planId: 'p1',
+    title: 't',
+    createdAt: at(-300),
+    updatedAt: at(2),
+    tombstones: [],
+    nodes: [
+      { id: 'a', title: 'Base', status: 'done', deps: [], doneAt: at(-200) },
+      ...[1, 2, 3, 4].map(i => ({ id: `old${i}`, title: `Old ${i}`, status: 'done', deps: ['a'], inserted: ins(-180, `old ask ${i}`), startedAt: at(-170), doneAt: at(-150) })),
+      { id: 'now', title: 'Done now', status: 'done', deps: ['a'], inserted: ins(-60, 'finish me'), startedAt: at(-50), doneAt: at(2) },
+      { id: 'open', title: 'Still open', status: 'todo', deps: ['a'], inserted: ins(-60, 'later please') },
+      { id: 'fresh', title: 'Fresh ask', status: 'todo', deps: ['a'], inserted: ins(1, 'new idea') },
+    ],
+  })
+
+  test('done in earlier turns: plain done; done or added this turn: violet; added earlier and still open: neutral with a dim ◇ before the title', async ($, on) => {
+    const files: Record<string, string> = { [`${PLANS}p1.json`]: JSON.stringify(sample()) }
+    const w = world(on, files, BIND('p1'))
+    on('turn.start', ($, e) => ({ turnId: e.turnId }))
+    await $.session.start(START)
+    await $.turn.start({ text: 'go', turnId: 't1' } as never)
+    await w.clock.advance(3 * 60_000)
+    const V = THEMES.dark.ins
+    // 全圖（桌面）：只有本輪的兩個用紫色圖示；舊的完成步驟沒有任何記號；未完成的舊插入：一般圖示 + 淡色 ◇
+    const ui = await $.ui.mount(PANE(120))
+    await ui.press({ key: 'fold-done' })
+    const icons = (await ui.findAll({ type: 'Svg' })).filter(s => Number(s.props.width) === 20).map(s => String(s.props.source))
+    expect(icons.filter(s => s.includes(V)).length).toBe(2)
+    const texts = await ui.findAll({ type: 'Text' })
+    expect(texts.filter(x => x.text === '◇').map(x => x.props.dimColor)).toEqual([true])
+    expect(texts.find(x => x.text.includes('new idea'))?.props.color).toBe(V)
+    expect(texts.find(x => x.text.includes('finish me'))?.props.color).toBe(V)
+    expect(texts.find(x => x.text.includes('later please'))?.props.color).toBeUndefined()
+    expect(texts.some(x => x.text.includes('old ask'))).toBe(false)
+    await ui.unmount()
+    // 終端機：◆（本輪完成）、◇ 紫（本輪加）、淡色 ◇ 記號；舊的完成步驟是一般的 ✓
+    const term = await $.ui.mount(PANE(100, 'terminal'))
+    const tt = await term.findAll({ type: 'Text' })
+    expect(tt.filter(x => x.text === '◆').map(x => x.props.color)).toEqual(['merged'])
+    expect(tt.filter(x => x.text === '◇').map(x => [x.props.color, x.props.dimColor])).toEqual([
+      [undefined, true],
+      ['merged', undefined],
+    ])
+    expect(tt.filter(x => x.text === '✓').length).toBe(5)
+    await term.unmount()
+    // 流程圖與展開的卡片：同一規則
+    const map = sample() as unknown as WorkflowMap
+    const clock = { now: Date.parse(at(3)), staleMin: 30, turnAt: Date.parse(NOW) }
+    const svg = flowSvg(map, layoutFlow(map, { width: 600, lang: 'en' }), 'en', THEMES.dark, clock).source
+    expect(svg.split(V).length - 1).toBe(2)
+    expect(svg.split('>◇<').length - 1).toBe(1)
+    const band = bandGraph(map, stageView(map, { expandFuture: true }), 'en', THEMES.dark, 900, clock).main!.source
+    expect([band.split(V).length - 1, band.split('>◇<').length - 1]).toEqual([1, 1])
+    // 下一輪：本輪完成的變回一般完成；本輪加的仍未完成 → 一般圖示 + 淡色 ◇
+    const next = { ...clock, now: Date.parse(at(30)), turnAt: Date.parse(at(20)) }
+    const svg2 = flowSvg(map, layoutFlow(map, { width: 600, lang: 'en' }), 'en', THEMES.dark, next).source
+    expect([svg2.split(V).length - 1, svg2.split('>◇<').length - 1]).toEqual([0, 2])
   })
 })

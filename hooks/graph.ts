@@ -5,6 +5,24 @@ import type { Lang } from './i18n'
 
 export const STATUSES: readonly WorkflowStatus[] = ['todo', 'doing', 'done', 'blocked', 'dropped']
 const MARK: Record<WorkflowStatus, string> = { done: '✓', doing: '▶', todo: '○', blocked: '✗', dropped: '–' }
+/** 流程圖的形狀（見 flow.ts）；note = 提醒，只畫在流程圖，不算一步 */
+export const KINDS = ['step', 'decision', 'note'] as const
+
+/** 算作「一步」：未取消、亦不是提醒（note）。進度、可開始、階段、聚焦都只看這些。 */
+export const isStep = (n: WorkflowNode) => n.status !== 'dropped' && n.kind !== 'note'
+/**
+ * 插入的步驟用紫色 ◇ 只限「本輪」：本輪插入的，或本輪完成的（turnAt = 本輪開始的時間；0 = 未有一輪 → 都不是）。
+ * 下一輪開始就回到一般樣式：完成的 = 一般完成（沒有記號）；舊輪插入、未完成的 = 一般狀態 + 標題前一個淡色 ◇（insertedMarked）。
+ * 取消的一律一般樣式。插入紀錄仍在詳情、時間線、匯出。
+ */
+export function insertedHot(n: WorkflowNode, turnAt = 0): boolean {
+  if (!n.inserted || n.status === 'dropped' || !turnAt) return false
+  const at = (iso?: string) => Date.parse(iso ?? '') || 0
+  return at(n.inserted.at) >= turnAt || (n.status === 'done' && at(n.doneAt) >= turnAt)
+}
+export const insertedMarked = (n: WorkflowNode, turnAt = 0) => !!n.inserted && n.status !== 'done' && n.status !== 'dropped' && !insertedHot(n, turnAt)
+/** 依賴已不用等：完成、取消、或是提醒 */
+const settledNode = (n: WorkflowNode | undefined) => !n || n.status === 'done' || !isStep(n)
 
 /** 檔案格式版本：2 = 加入 planId、title、createdAt、tombstones、每步 updatedAt（見 docs/FORMAT.md） */
 export const SCHEMA_VERSION = 2
@@ -39,8 +57,11 @@ export function validateMap(raw: unknown): WorkflowMap | string {
     if (!isStr(n.title)) return `${n.id}.title is invalid`
     if (!STATUSES.includes(n.status as WorkflowStatus)) return `${n.id}.status is invalid`
     if (!Array.isArray(n.deps) || !n.deps.every(isStr)) return `${n.id}.deps is invalid`
-    if (n.lane !== undefined && !isStr(n.lane)) return `${n.id}.lane is invalid`
-    if (n.note !== undefined && !isStr(n.note)) return `${n.id}.note is invalid`
+    for (const k of ['lane', 'note', 'kind', 'edgeLabel'] as const) if (n[k] !== undefined && !isStr(n[k])) return `${n.id}.${k} is invalid`
+    if (n.impact !== undefined) {
+      const im = n.impact
+      if (!isObj(im) || !(['added', 'rewired', 'downstream'] as const).every(k => Array.isArray(im[k]) && (im[k] as unknown[]).every(isStr))) return `${n.id}.impact is invalid`
+    }
     if (n.inserted !== undefined) {
       const ins = n.inserted
       if (!isObj(ins) || !isStr(ins.at) || !isStr(ins.note)) return `${n.id}.inserted is invalid`
@@ -117,7 +138,7 @@ export function mergeMaps(disk: WorkflowMap, ours: WorkflowMap): WorkflowMap {
 }
 
 /** 全部步驟都完成或取消（有步驟才算） */
-export const planFinished = (map: WorkflowMap) => map.nodes.length > 0 && map.nodes.every(n => n.status === 'done' || n.status === 'dropped')
+export const planFinished = (map: WorkflowMap) => map.nodes.length > 0 && map.nodes.every(n => n.status === 'done' || !isStep(n))
 
 /** 搵一個環，返環上嘅 id 路徑（首尾相同），冇就 undefined。 */
 export function findCycle(nodes: readonly WorkflowNode[]): string[] | undefined {
@@ -173,14 +194,12 @@ export function columns(nodes: readonly WorkflowNode[]): WorkflowNode[][] {
   return cols.map(c => c ?? [])
 }
 
-const settled = (s: WorkflowStatus | undefined) => s === 'done' || s === 'dropped'
-
-/** 可以開工：todo 而且所有（有效）依賴都完／棄。 */
+/** 可以開工：todo 的步驟（提醒不算）而且所有（有效）依賴都完／棄。 */
 export function readyIds(nodes: readonly WorkflowNode[]): Set<string> {
   const byId = new Map(nodes.map(n => [n.id, n]))
   return new Set(
     nodes
-      .filter(n => n.status === 'todo' && n.deps.every(d => !byId.has(d) || settled(byId.get(d)?.status)))
+      .filter(n => n.status === 'todo' && n.kind !== 'note' && n.deps.every(d => settledNode(byId.get(d))))
       .map(n => n.id),
   )
 }
@@ -188,7 +207,7 @@ export function readyIds(nodes: readonly WorkflowNode[]): Set<string> {
 export type Stats = { done: number; total: number; doing: string[]; ready: string[]; inserted: number }
 
 export function stats(map: WorkflowMap): Stats {
-  const live = map.nodes.filter(n => n.status !== 'dropped')
+  const live = map.nodes.filter(isStep)
   const ready = readyIds(map.nodes)
   return {
     done: live.filter(n => n.status === 'done').length,
@@ -199,7 +218,7 @@ export function stats(map: WorkflowMap): Stats {
   }
 }
 
-export const isActive = (map: WorkflowMap) => map.nodes.some(n => n.status === 'todo' || n.status === 'doing')
+export const isActive = (map: WorkflowMap) => map.nodes.some(n => isStep(n) && (n.status === 'todo' || n.status === 'doing'))
 
 export const allDone = (map: WorkflowMap) => {
   const s = stats(map)
@@ -226,14 +245,14 @@ export function plainLines(map: WorkflowMap, lang: Lang = 'en'): string[] {
   const doingTitles = map.nodes.filter(n => n.status === 'doing').map(n => n.title)
   // 最有用的先列：進行中 → 受阻 → 未開始 → 已完成 → 已取消（同組內按先後次序）
   const rank: Record<WorkflowStatus, number> = { doing: 0, blocked: 1, todo: 2, done: 3, dropped: 4 }
-  return columns(map.nodes)
+  return columns(map.nodes.filter(n => n.kind !== 'note'))
     .flat()
     .map((n, i) => ({ n, i }))
     .sort((a, b) => rank[a.n.status] - rank[b.n.status] || a.i - b.i)
     .map(({ n }) => {
       const extra: string[] = []
       if (n.status === 'doing' && doingTitles.length > 1) extra.push(t.parallel(doingTitles.filter(x => x !== n.title).join(t.list)))
-      const waiting = n.deps.map(d => byId.get(d)).filter(d => d && d.status !== 'done' && d.status !== 'dropped')
+      const waiting = n.deps.map(d => byId.get(d)).filter(d => !settledNode(d))
       if (n.status === 'todo' && waiting.length) extra.push(t.waits(waiting.map(d => d!.title).join(t.list)))
       if (ready.has(n.id)) extra.push(t.ready)
       if (n.inserted) extra.push(t.inserted(n.inserted.note))
@@ -246,7 +265,13 @@ export const GLYPH: Record<WorkflowStatus, string> = { done: '━', doing: '●'
 
 /** 一步的文字（給模型）：✓A 標題 ←依賴 [ready; owner: x; inserted: …] */
 function nodeText(n: WorkflowNode, ready: Set<string>): string {
-  const tags = [ready.has(n.id) ? 'ready' : '', n.owner ? `owner: ${n.owner}` : '', n.inserted ? `inserted: ${n.inserted.note}` : ''].filter(Boolean)
+  const tags = [
+    ready.has(n.id) ? 'ready' : '',
+    n.kind && n.kind !== 'step' ? n.kind : '',
+    n.lane ? `lane: ${n.lane}` : '',
+    n.owner ? `owner: ${n.owner}` : '',
+    n.inserted ? `inserted: ${n.inserted.note}` : '',
+  ].filter(Boolean)
   const deps = n.deps.length ? ` ←${n.deps.join(',')}` : ''
   return `${MARK[n.status]}${n.id} ${n.title}${deps}${tags.length ? ` [${tags.join('; ')}]` : ''}`
 }
@@ -286,6 +311,8 @@ export type NodeInput = {
   status?: WorkflowStatus
   deps?: string[]
   lane?: string
+  kind?: (typeof KINDS)[number]
+  edgeLabel?: string
   note?: string
   owner?: string
 }
@@ -309,13 +336,22 @@ function merge(base: WorkflowNode | undefined, inp: NodeInput): WorkflowNode | s
   if (!isStr(inp.id) || inp.id.trim() === '') return 'every node needs an id'
   if (inp.status !== undefined && !STATUSES.includes(inp.status)) return `${inp.id}: status must be ${STATUSES.join('/')}`
   if (inp.deps !== undefined && (!Array.isArray(inp.deps) || !inp.deps.every(isStr))) return `${inp.id}: deps must be an array of ids`
+  for (const k of ['lane', 'note', 'edgeLabel'] as const) if (inp[k] !== undefined && !isStr(inp[k])) return `${inp.id}: ${k} must be text`
+  if (inp.kind !== undefined && !KINDS.includes(inp.kind)) return `${inp.id}: kind must be ${KINDS.join('/')}`
   const title = inp.title ?? base?.title
   if (!isStr(title) || title.trim() === '') return `${inp.id}: a new node needs a title`
   const out: WorkflowNode = { ...(base ?? { id: inp.id, status: 'todo', deps: [] }), title }
   if (inp.status !== undefined) out.status = inp.status
   if (inp.deps !== undefined) out.deps = [...new Set(inp.deps)]
-  if (inp.lane !== undefined) out.lane = inp.lane
   if (inp.note !== undefined) out.note = inp.note
+  // 組名、線上標籤：空字串 = 拿走；kind step = 預設（不寫入檔）
+  for (const k of ['lane', 'edgeLabel'] as const) {
+    const v = inp[k]?.trim()
+    if (v) out[k] = v
+    else if (v !== undefined) delete out[k]
+  }
+  if (inp.kind === 'step') delete out.kind
+  else if (inp.kind !== undefined) out.kind = inp.kind
   if (inp.owner !== undefined) {
     if (!isStr(inp.owner)) return `${inp.id}: owner must be text`
     if (inp.owner.trim()) out.owner = inp.owner.trim()
@@ -373,6 +409,21 @@ function finish(base: WorkflowMap, nodes: WorkflowNode[], now: string, o: { info
   }
 }
 
+/** 由 ids 出發、沿「誰等它」一路往後的全部未完成步驟（不含 ids 本身；計劃次序；有環也不會無限走） */
+export function downstreamOf(nodes: readonly WorkflowNode[], ids: readonly string[]): string[] {
+  const after = new Map<string, string[]>()
+  for (const m of nodes) for (const d of m.deps) after.set(d, [...(after.get(d) ?? []), m.id])
+  const seen = new Set(ids)
+  const queue = [...ids]
+  while (queue.length)
+    for (const m of after.get(queue.shift()!) ?? [])
+      if (!seen.has(m)) {
+        seen.add(m)
+        queue.push(m)
+      }
+  return nodes.filter(n => seen.has(n.id) && !ids.includes(n.id) && isStep(n) && n.status !== 'done').map(n => n.id)
+}
+
 /** 每步最多保留幾筆狀態紀錄 */
 export const LOG_MAX = 10
 
@@ -410,7 +461,7 @@ export function etaMin(map: WorkflowMap, nowMs: number): number | undefined {
   if (durs.length < 3) return undefined
   const mid = durs.length >> 1
   const median = durs.length % 2 ? durs[mid]! : (durs[mid - 1]! + durs[mid]!) / 2
-  const open = map.nodes.filter(n => n.status !== 'done' && n.status !== 'dropped')
+  const open = map.nodes.filter(n => isStep(n) && n.status !== 'done')
   if (open.length === 0) return undefined
   let total = 0
   for (const level of columns(open))
@@ -456,6 +507,7 @@ export function applyOp(map: WorkflowMap, op: Op, now: string, by?: string): App
       for (const m of nodes) {
         const old = byId.get(m.id)
         if (old?.inserted) m.inserted = old.inserted // 用戶插入嘅標記唔准被蓋走
+        if (old?.impact) m.impact = old.impact
         // 同一步驟的時間、負責人、紀錄沿用
         for (const k of ['startedAt', 'doneAt', 'log', 'owner'] as const) if (old?.[k] !== undefined && m[k] === undefined) (m as Record<string, unknown>)[k] = old[k]
       }
@@ -487,6 +539,12 @@ export function applyOp(map: WorkflowMap, op: Op, now: string, by?: string): App
           if (!target) return { error: `before names an unknown node: ${b}` }
           next.set(b, { ...target, deps: [...new Set([...target.deps, ...newIds])] })
         }
+      }
+      if (op.op === 'insert') {
+        // 插入的影響（插入當刻）：新增的步驟、改為要等它的步驟、因此要等的全部未完成後續步驟
+        const added = op.nodes.map(n => n.id)
+        const impact = { added, rewired: [...new Set(op.before ?? [])], downstream: downstreamOf([...next.values()], added) }
+        for (const id of added) next.set(id, { ...next.get(id)!, impact })
       }
       return finish(map, [...next.values()], now, { by })
     }
@@ -545,7 +603,7 @@ export type FocusOptions = {
  * 已完成全部收成一粒；更遠的未來收成一粒。步驟數 ≤ 6 時不收。
  */
 export function focusSet(map: WorkflowMap, o: FocusOptions = {}): Focus {
-  const live = map.nodes.filter(n => n.status !== 'dropped')
+  const live = map.nodes.filter(isStep)
   const done = live.filter(n => n.status === 'done')
   const open = live.filter(n => n.status !== 'done')
   if (live.length <= (o.smallPlan ?? 6)) return { visible: new Set(live.map(n => n.id)), doneFolded: [], futureFolded: [] }
@@ -589,7 +647,7 @@ export type StageView = {
  * 之後的層收成「稍後」。聚焦規則（小計劃不收、本輪插入一定顯示、展開）沿用 focusSet。
  */
 export function stageView(map: WorkflowMap, o: FocusOptions = {}): StageView {
-  const live = map.nodes.filter(n => n.status !== 'dropped')
+  const live = map.nodes.filter(isStep)
   const open = live.filter(n => n.status !== 'done')
   const ready = readyIds(map.nodes)
   const rank = (n: WorkflowNode) => (n.status === 'doing' ? 0 : n.status === 'blocked' ? 1 : ready.has(n.id) ? 2 : 3)
@@ -607,6 +665,16 @@ export function stageView(map: WorkflowMap, o: FocusOptions = {}): StageView {
     levels: all.slice(0, last + 1),
     later: all.slice(last + 1).flat(),
   }
+}
+
+/** 插入的影響一句：「影響：+1 步 · 1 步改為等它 · 後續 3 步（甲、乙、丙）」 */
+export function impactText(map: WorkflowMap, n: WorkflowNode, lang: Lang): string {
+  const t = STR[lang]
+  const im = n.impact
+  if (!im) return ''
+  const byId = new Map(map.nodes.map(m => [m.id, m.title]))
+  const names = im.downstream.map(id => byId.get(id)).filter(Boolean)
+  return `${t.dImpact(im.added.length, im.rewired.length, im.downstream.length)}${names.length ? `${t.open}${names.join(t.list)}${t.close}` : ''}`
 }
 
 /** ISO → 本地 MM-DD HH:MM；缺少或無效（含 1970 起點）時回傳空字串。 */
@@ -632,12 +700,13 @@ export function exportMarkdown(map: WorkflowMap, lang: Lang, nowMs: number): str
   const line = (n: WorkflowNode): string[] => {
     const min = elapsedMin(n, nowMs)
     const state = n.status === 'todo' ? (ready.has(n.id) ? t.ready : '') : n.status === 'done' ? '' : t.status[n.status]
-    const waiting = n.deps.map(d => byId.get(d)).filter((d): d is WorkflowNode => !!d && d.status !== 'done' && d.status !== 'dropped')
+    const waiting = n.deps.map(d => byId.get(d)).filter((d): d is WorkflowNode => !settledNode(d))
     const meta = [n.owner ?? '', state, min === undefined ? '' : t.dur(min), n.status !== 'done' && waiting.length ? t.waitShort(waiting.map(d => d.title).join(t.list)) : '']
       .filter(Boolean)
       .join(' · ')
     const out = [`- [${n.status === 'done' ? 'x' : ' '}] ${n.title.replace(/\s+/g, ' ')}${meta ? ` — ${meta}` : ''}`]
     if (n.inserted) out.push(`  - ◇ ${t.helpLegend.ins}${fmtTime(n.inserted.at) ? ` (${fmtTime(n.inserted.at)})` : ''}: “${n.inserted.note}”`)
+    if (n.impact) out.push(`  - ${impactText(map, n, lang)}`)
     if (n.note && n.status !== 'done') out.push(`  - ${n.note}`)
     return out
   }
@@ -651,7 +720,34 @@ export function exportMarkdown(map: WorkflowMap, lang: Lang, nowMs: number): str
   ]
   if (view.done.length) out.push('', `## ✓ ${t.doneStage(view.done.length)}`, ...view.done.flatMap(line))
   view.levels.forEach((lv, i) => out.push('', `## ${t.stage(i + 1, lv.length)}`, ...lv.flatMap(line)))
+  const tl = timeline(map, lang)
+  if (tl.length) out.push('', `## ${t.timelineBtn}`, ...tl.map(e => `- ${fmtTime(e.at)} ${e.text}`))
   return `${out.join('\n')}\n`
+}
+
+export type TimelineEvent = { at: string; text: string }
+
+/**
+ * 時間線（由舊到新）：開計劃、加入步驟（每步紀錄的第一筆）、用戶中途的要求（原話）、狀態變化（誰）、還原。
+ * 只由檔案已有的資料推算（每步最多 LOG_MAX 筆紀錄，更早的不在）；沒有時間的略過。
+ */
+export function timeline(map: WorkflowMap, lang: Lang): TimelineEvent[] {
+  const t = STR[lang]
+  const ev: { at: string; ms: number; seq: number; text: string }[] = []
+  const push = (at: string | undefined, text: string) => {
+    const v = Date.parse(at ?? '')
+    if (at && v > 86_400_000) ev.push({ at, ms: v, seq: ev.length, text })
+  }
+  push(map.createdAt, t.tlCreated(map.title && map.title !== 'demo' ? map.title : ''))
+  for (const n of map.nodes) {
+    if (n.inserted) push(n.inserted.at, t.tlInserted(n.title, n.inserted.note))
+    ;(n.log ?? []).forEach((e, i) => {
+      if (i === 0 && !n.inserted) push(e.at, t.tlAdded(n.title))
+      if (i === 0 && e.status === 'todo') return
+      push(e.at, e.by === 'undo' ? t.tlUndo(n.title, t.status[e.status]) : t.tlStatus(n.title, t.status[e.status], e.by ?? ''))
+    })
+  }
+  return ev.sort((a, b) => a.ms - b.ms || a.seq - b.seq).map(({ at, text }) => ({ at, text }))
 }
 
 export const DONE_ID = '__done__'
