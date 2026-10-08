@@ -129,6 +129,13 @@ echo '{"language":"en"}' | claude plugin configure workflow-map --values-stdin
 
 The map lives in local files in your project (`.claude/workflow-map.json` and the `.claude/workflow-map.history/` folder). The plugin makes no network requests of its own; the only model use is the suggestions' one short fork per answer, made through Claude Code like any other turn (turn it off with `suggestions: false`).
 
+## Feedback
+
+Ideas, questions and bug reports are very welcome:
+
+- **Feature ideas:** [open a feature request](https://github.com/mimateinn/workflow-map/issues/new?template=feature_request.yml) or start a thread in [Discussions](https://github.com/mimateinn/workflow-map/discussions).
+- **Something broken or ugly:** [file a bug](https://github.com/mimateinn/workflow-map/issues/new?template=bug_report.yml); a screenshot helps.
+
 ## Development
 
 ```sh
@@ -159,3 +166,5 @@ The next-prompt suggestions are derived from [next-steps](https://github.com/ant
 - 終端機：`claude plugin install workflow-map --marketplace mimateinn/workflow-map`
 
 全圖右上角的 **?**（或輸入 `/workflow help`）有簡短說明和圖示解釋。想先看效果：輸入 `/workflow-demo`（只在畫面顯示，不寫入任何檔案）。
+
+**意見與建議：**歡迎到 [Discussions](https://github.com/mimateinn/workflow-map/discussions) 提出想法，或開 [功能建議](https://github.com/mimateinn/workflow-map/issues/new?template=feature_request.yml)／[錯誤回報](https://github.com/mimateinn/workflow-map/issues/new?template=bug_report.yml)。

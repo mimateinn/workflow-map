@@ -1,0 +1,28 @@
+name: Feature request
+description: Suggest something workflow-map should do
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: The situation or workflow where workflow-map falls short today.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would help?
+      description: Your idea. A sketch or screenshot is welcome.
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Where do you use Claude Code?
+      multiple: true
+      options:
+        - Desktop app
+        - Terminal (CLI)
+        - IDE extension
+        - Other

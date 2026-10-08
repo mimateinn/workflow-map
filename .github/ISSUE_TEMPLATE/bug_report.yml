@@ -1,0 +1,39 @@
+name: Bug report
+description: Something looks wrong or doesn't work
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you saw, and what you expected instead. A screenshot helps a lot for anything visual.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to reproduce
+      description: Steps, or the kind of plan that triggers it (e.g. long titles, many parallel steps).
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: workflow-map version and Claude Code version (`claude --version`)
+      placeholder: workflow-map 0.4.2, Claude Code 2.1.294
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Where?
+      multiple: true
+      options:
+        - Desktop app
+        - Terminal (CLI)
+        - IDE extension
+  - type: dropdown
+    id: os
+    attributes:
+      label: OS
+      options:
+        - Windows
+        - macOS
+        - Linux
