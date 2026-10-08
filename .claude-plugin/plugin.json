@@ -1,24 +1,39 @@
 {
   "name": "workflow-map",
-  "version": "0.2.0",
-  "description": "Live workflow map: one row above the prompt (what is running, what is next, segmented progress) that expands into a card graph of parallel steps, plus a full stage-by-stage view, with your mid-plan interjections clearly marked.",
+  "version": "0.3.0",
+  "description": "Live workflow map: one row above the prompt (what is running, what is next, segmented progress) that expands into a card graph of parallel steps, plus a full stage-by-stage view, with your mid-plan interjections clearly marked, owners and timing per step, sub-agent sync and plan history.",
   "author": {
     "name": "mimateinn"
   },
   "license": "MIT",
   "types": "./types/index.d.ts",
   "userConfig": {
+    "notify": {
+      "type": "boolean",
+      "title": "Notifications",
+      "description": "Show a short notification when a sub-agent finishes a step, when a step becomes blocked, or when a step in progress has had no update for staleMinutes.",
+      "default": true
+    },
+    "suggestions": {
+      "type": "boolean",
+      "title": "Suggest next prompts",
+      "description": "After each answer, suggest up to three next prompts as the band's last row (1, 2, 3 put one in the prompt box; 0 hides them).",
+      "default": true
+    },
+    "staleMinutes": {
+      "type": "number",
+      "title": "Stale after (minutes)",
+      "description": "A step in progress with no update for this many minutes is marked amber (\"no update\"). 0 turns the check off.",
+      "default": 30,
+      "min": 0,
+      "max": 1440
+    },
     "language": {
       "type": "string",
       "title": "Language",
-      "description": "Interface language. auto = the language of your most recent prompt (Traditional Chinese, Simplified Chinese or English); English when unsure.",
+      "description": "Interface language. auto = the script of your most recent prompt (Traditional Chinese, Japanese, Korean; otherwise English). Spanish, French and German only when chosen here.",
       "default": "auto",
-      "options": [
-        "auto",
-        "zh-Hant",
-        "zh-Hans",
-        "en"
-      ]
+      "options": ["auto", "en", "zh-Hant", "ja", "ko", "es", "fr", "de"]
     }
   }
 }

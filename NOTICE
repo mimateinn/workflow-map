@@ -1,0 +1,16 @@
+workflow-map
+Copyright (c) 2026 mimateinn. Licensed under the MIT License (see LICENSE).
+
+This product includes software derived from "next-steps" in anthropics/claude-plugins-community
+(original work by Thariq Shihipar / Anthropic), licensed under the Apache License, Version 2.0
+(see LICENSE-APACHE). The derived code is hooks/suggest.ts and the computeSuggestions function
+and suggestion row in hooks/register.tsx; the ported tests are at the end of tests/workflow-map.test.tsx.
+
+Changes made to the derived code:
+- merged into workflow-map: the suggestions are the last row of workflow-map's band, sharing its
+  left edge, icon column and controls, instead of a band of their own;
+- the interface language comes from workflow-map's own detection (its separate detector was dropped);
+- the plan's ready steps are read from workflow-map's in-memory plan instead of re-reading the file,
+  and lead the three slots; the fork is skipped when the plan already offers three ready steps;
+- compact row drawing (plain buttons, hotkeys 1/2/3, 0 to dismiss), input sanitising kept as is;
+- one option, `suggestions`, turns the feature on or off.
