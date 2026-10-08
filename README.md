@@ -4,7 +4,7 @@
 
 ![workflow-map intro](docs/intro.gif)
 
-▶ [Watch the intro in full quality (MP4, 22 s)](docs/intro.mp4)
+▶ [Watch the intro in full quality (MP4, 31 s)](docs/intro.mp4)
 
 ## What it does
 
@@ -24,9 +24,11 @@
 |---|---|
 | ![Collapsed row](docs/collapsed.png) | ![Expanded card graph](docs/expanded.png) |
 
-![Full workflow pane](docs/pane.png)
+| Full view (Details open) | Help |
+|---|---|
+| ![Full view: In progress and Next sections, one step's Details open](docs/pane.png) | ![Help card: language menu, icon legend and commands](docs/help.png) |
 
-<sub>The collapsed and expanded rows are rendered by the plugin's own drawing code (dark theme). In the full view the app lays out the cards itself; that picture is rendered from the plugin's element tree with an approximation of the app's layout.</sub>
+<sub>The collapsed and expanded rows are rendered by the plugin's own drawing code (dark theme). In the full view, the Help card and the band's hover lists the app lays out the elements itself; those pictures are rendered from the plugin's element tree with an approximation of the app's layout. The intro video uses the same renders.</sub>
 
 ## Install
 
