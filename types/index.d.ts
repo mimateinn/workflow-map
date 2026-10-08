@@ -48,6 +48,10 @@ export type WorkflowMap = {
 
 /** 下一句建議（併入自 next-steps） */
 export type Suggestion = { label: string; prompt: string }
+/** 模型內建待辦清單的一項（TodoWrite 以內容為 key；TaskCreate 以 task id 為 key）與對應的步驟 id */
+export type TodoItem = { key: string; title: string; status: string; blockedBy: string[]; step?: string }
+/** 待辦清單的鏡像；plan = 由待辦清單自動建立的計劃 id（'' = 沒有） */
+export type TodoMirror = { items: TodoItem[]; plan: string }
 export type SuggestView = { kind: 'hidden' } | { kind: 'loading'; turnId: string } | { kind: 'offer'; items: Suggestion[] }
 
 declare module 'claude-code' {
@@ -93,6 +97,12 @@ declare module 'claude-code' {
       lang: string
       /** app 主題是淺色（由 /config 的 theme 判斷；Svg 以圖片繪製讀不到主題） */
       light: boolean
+      /** 模型內建待辦清單的鏡像（TodoWrite／TaskCreate／TaskUpdate） */
+      todos: TodoMirror
+      /** 本輪主對話的實際工作次數（改檔、執行指令） */
+      work: number
+      /** 「可用 /workflow 開始計劃」提示：0 = 未出現、1 = 顯示中、2 = 已出現過（每個 session 一次） */
+      nudge: number
     }
   }
 }

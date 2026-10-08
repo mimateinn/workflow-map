@@ -170,6 +170,9 @@ export type Strings = {
   languageLabel: string
   /** 彈出清單最後一行：還有幾項（全圖看） */
   peekMore: (n: number) => string
+  /** 由模型的待辦清單自動建立計劃時的通知；沒有計劃但做了不少工作時的一行提示 */
+  autoPlanMade: string
+  nudge: string
   /** 每個 session 的計劃：清單、加入、離開 */
   plans: string
   hidePlans: string
@@ -309,6 +312,8 @@ const ZH_HANT: Strings = {
   planNotFound: r => `找不到計劃：${r}`,
   languageLabel: '語言',
   peekMore: n => `… 還有 ${n} 項 · 全圖`,
+  autoPlanMade: '已根據待辦清單建立工作流程',
+  nudge: '可用 /workflow 開始計劃',
   continueLead: '繼續做：',
   fillFail: '未能放入輸入框',
   history: '歷史紀錄',
@@ -428,6 +433,8 @@ const EN: Strings = {
   planNotFound: r => `No plan found: ${r}`,
   languageLabel: 'Language',
   peekMore: n => `… +${n} more · Full view`,
+  autoPlanMade: 'Workflow created from the to-do list',
+  nudge: 'Use /workflow to start a plan',
   continueLead: 'Continue: ',
   fillFail: 'Could not fill the prompt box',
   history: 'History',
@@ -548,6 +555,8 @@ const JA: Strings = {
   planNotFound: r => `計画が見つかりません：${r}`,
   languageLabel: '言語',
   peekMore: n => `… 他 ${n} 件 · 全体`,
+  autoPlanMade: 'ToDo リストからワークフローを作成しました',
+  nudge: '/workflow で計画を始められます',
   continueLead: '続けて：',
   fillFail: '入力欄に入れられませんでした',
   history: '履歴',
@@ -664,6 +673,8 @@ const KO: Strings = {
   planNotFound: r => `계획을 찾을 수 없습니다: ${r}`,
   languageLabel: '언어',
   peekMore: n => `… ${n}개 더 · 전체`,
+  autoPlanMade: '할 일 목록으로 워크플로를 만들었습니다',
+  nudge: '/workflow 로 계획을 시작할 수 있습니다',
   continueLead: '계속: ',
   fillFail: '입력창에 넣지 못했습니다',
   history: '기록',
@@ -778,6 +789,8 @@ const ES: Strings = {
   planNotFound: r => `No se encontró el plan: ${r}`,
   languageLabel: 'Idioma',
   peekMore: n => `… ${n} más · Vista completa`,
+  autoPlanMade: 'Flujo de trabajo creado a partir de la lista de tareas',
+  nudge: 'Usa /workflow para empezar un plan',
   continueLead: 'Continúa: ',
   fillFail: 'No se pudo rellenar el cuadro de texto',
   history: 'Historial',
@@ -892,6 +905,8 @@ const FR: Strings = {
   planNotFound: r => `Plan introuvable : ${r}`,
   languageLabel: 'Langue',
   peekMore: n => `… ${n} de plus · Vue complète`,
+  autoPlanMade: 'Flux de travail créé à partir de la liste de tâches',
+  nudge: 'Utilisez /workflow pour commencer un plan',
   continueLead: 'Continue : ',
   fillFail: 'Impossible de remplir la zone de saisie',
   history: 'Historique',
@@ -1007,6 +1022,8 @@ const DE: Strings = {
   planNotFound: r => `Kein Plan gefunden: ${r}`,
   languageLabel: 'Sprache',
   peekMore: n => `… ${n} weitere · Gesamtansicht`,
+  autoPlanMade: 'Workflow aus der To-do-Liste erstellt',
+  nudge: 'Mit /workflow einen Plan beginnen',
   continueLead: 'Weiter: ',
   fillFail: 'Eingabefeld konnte nicht gefüllt werden',
   history: 'Verlauf',

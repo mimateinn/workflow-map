@@ -246,7 +246,7 @@ describe('help', () => {
       $.ui.mount({ plugin: 'workflow-map', surface: 'desktop', component: 'Pane', requestId: 'workflow-map', props: { title: 'x', isFocused: false, bodyColumns: 120 } as never })
     let ui = await mount()
     // 卡 = 有內距的圓角框（分段選擇的軌與選項不算）
-    const frames = async () => (await ui.findAll({ type: 'Box' })).filter(b => b.props.borderStyle === 'round' && b.props.padding !== undefined).length
+    const frames = async () => (await ui.findAll({ type: 'Box' })).filter(b => b.props.borderStyle === 'round' && b.props.paddingX !== undefined).length
     const cardsOnly = await frames()
     expect(await allText(ui)).not.toContain('Legend')
     await ui.press({ key: 'help' })
@@ -291,15 +291,21 @@ describe('help', () => {
     await ui.unmount()
   })
 
-  test('terminal pane draws the same help as text', async ($, on) => {
+  test('terminal pane draws the same help: native language menu, glyph legend, ─ dividers', async ($, on) => {
     world(on, {})
     await $.session.start(START)
     await $.command.run({ command: 'workflow-demo', args: '', origin: { kind: 'composer' } } as never)
     const ui = await $.ui.mount({ plugin: 'workflow-map', surface: 'terminal', component: 'Pane', requestId: 'workflow-map', props: { title: 'x', isFocused: false, bodyColumns: 100 } as never })
     await ui.press({ key: 'help' })
     const all = await allText(ui)
-    expect(all).toContain('Legend')
-    expect(all).toContain('◇')
+    for (const s of ['Legend', 'Added by you', '/workflow-demo', 'staleMinutes']) expect([s, all.includes(s)]).toEqual([s, true])
+    expect((await ui.find({ key: 'help-lang' }))?.type).toBe('Select')
+    // 圖例：字元符號，主題色
+    const glyphs = (await ui.findAll({ type: 'Text' })).filter(x => /^[✓◉○!◇●]$/.test(x.text)).map(x => [x.text, x.props.color ?? ''])
+    for (const g of [['✓', 'success'], ['◉', 'claude'], ['!', 'warning'], ['◇', 'merged'], ['◉', 'warning'], ['●', 'warning']]) expect(glyphs).toContainEqual(g)
+    expect(await ui.findAll({ type: 'Svg' })).toEqual([])
+    expect(await ui.findAll({ type: 'Markdown' })).toEqual([])
+    expect((await ui.findAll({ type: 'Text' })).some(x => /^─{20,}$/.test(x.text))).toBe(true)
     await ui.unmount()
   })
 })
@@ -486,15 +492,18 @@ describe('band', () => {
     await ui.unmount()
   })
 
-  test('terminal: one text line, expands to plain lines', async ($, on) => {
+  test('terminal: the title row reads like the desktop one; it expands to box-drawn cards', async ($, on) => {
     world(on, {})
     await $.session.start(START)
     await $.tool.call({ tool: TOOL, op: 'set_plan', nodes: plan().nodes.map(({ id, title, status, deps }) => ({ id, title, status, deps })) })
     const ui = await $.ui.mount({ plugin: 'workflow-map', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS })
-    expect((await ui.find({ type: 'Text', text: /1\/4/ }))?.text).toContain('寫 API')
-    await ui.press({ key: 'toggle' })
+    const title = await ui.find({ key: 'title' })
+    expect(title?.text).toContain('寫 API')
+    expect(title?.text).toContain('1/4')
     // 未有用戶輸入：介面語言跟步驟名稱（繁中）
-    expect(await ui.find({ type: 'Text', text: /可開始/ })).toBeDefined()
+    expect(await ui.find({ type: 'Button', text: '展開' })).toBeDefined()
+    await ui.press({ key: 'toggle' })
+    expect((await ui.find({ key: 'graph' }))?.text).toContain('1 已完成')
     await ui.unmount()
   })
 
@@ -505,7 +514,8 @@ describe('band', () => {
     await $.command.run({ command: 'workflow-demo', args: '', origin: { kind: 'composer' } } as never)
     expect(files[FILE]).toBeUndefined()
     const ui = await $.ui.mount({ plugin: 'workflow-map', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS })
-    expect((await ui.find({ type: 'Text', text: /Card layout/ }))?.text).toContain('5/12')
+    expect((await ui.find({ key: 'title' }))?.text).toContain('Card layout')
+    expect((await ui.find({ key: 'title' }))?.text).toContain('5/12')
     await ui.unmount()
     await $.command.run({ command: 'workflow-demo', args: '', origin: { kind: 'composer' } } as never)
     expect(files[FILE]).toBeUndefined()
@@ -644,7 +654,7 @@ describe('pane', () => {
 
     // 每張卡同一個內距、卡與卡之間同一個間距
     const frames = boxes.filter(b => b.props.borderStyle === 'round')
-    for (const f of frames) expect([f.props.padding, f.props.marginTop]).toEqual([1, 0.5])
+    for (const f of frames) expect([f.props.paddingX, f.props.paddingY, f.props.marginTop]).toEqual([1, 1, 0.5])
     // 卡面：有填色、外框全透明（看不見外框）
     for (const f of frames) expect([f.props.backgroundColor, f.props.borderColor]).toEqual(['#ffffff0f', '#00000000'])
     // 卡內每一行都是 [圖示欄 20px][文字]：沒有圖示的行用同闊的空位
@@ -1320,6 +1330,244 @@ describe('band connectors', () => {
     for (const x of ends) expect(x).toBeLessThan(right)
     // 已完成小卡後面有卡：有線
     expect(pics((await ui.find({ key: 'peek-done' })) as El).join('')).toMatch(/ H\d/)
+    await ui.unmount()
+  })
+})
+
+describe('auto plan (the plugin itself keeps Claude on the plan)', () => {
+  type E = { prompt: { compose: (x: never) => Promise<unknown> } }
+  const guide = async ($: E, tools: string[] = [TOOL]) =>
+    ((await $.prompt.compose({ tools, model: 'm', promptModel: 'm', surfaces: [], outputStyle: null, traits: [] } as never)) as { sections: { id: string; text: string }[] }).sections.find(s => s.id === 'workflow-map:guide')?.text
+  // 內建工具的替身：照收照答（TaskCreate 回覆 task id）
+  const builtins = (on: On) => {
+    let n = 0
+    on('tool.call', { tool: ['TodoWrite', 'TaskCreate', 'TaskUpdate', 'Bash', 'Edit'] }, ($, e) => {
+      const x = e as unknown as Record<string, unknown>
+      if (x.tool === 'TaskCreate') return { result: { task: { id: String(++n), subject: x.subject } } } as never
+      return { result: { success: true } } as never
+    })
+  }
+  const todos = (...items: [string, string][]) => ({ tool: 'TodoWrite', todos: items.map(([content, status]) => ({ content, status, activeForm: content })) })
+  const steps = (files: Record<string, string>) =>
+    (cur(files).nodes as { id: string; title: string; status: string; deps: string[]; owner?: string }[]).map(n => [n.id, n.title, n.status, n.deps.join(','), n.owner ?? ''])
+  const MADE = 'Workflow created from the to-do list'
+
+  test('autoPlan on: the session prompt carries the firm plan rule, only when the tool is offered', async ($, on) => {
+    world(on, {})
+    on('prompt.compose', () => ({ sections: [] }))
+    await $.session.start(START)
+    const text = (await guide($)) ?? ''
+    for (const s of ['3+ steps', 'new_plan', 'doing', 'done or blocked', 'insert', 'BEFORE acting', '[wm:<step id>]', "user's language"]) expect(text).toContain(s)
+    expect(text.split(/\s+/).length).toBeLessThanOrEqual(110)
+    expect(await guide($, [])).toBeUndefined()
+  })
+
+  test('autoPlan off: only the short note', { options: { autoPlan: false } }, async ($, on) => {
+    world(on, {})
+    on('prompt.compose', () => ({ sections: [] }))
+    await $.session.start(START)
+    const text = (await guide($)) ?? ''
+    expect(text).toContain('only when the user asks')
+    expect(text).not.toContain('BEFORE acting')
+    expect(text.split(/\s+/).length).toBeLessThan(40)
+  })
+
+  test('TodoWrite with no plan: exactly one plan from the list (owner auto, in order), one toast, statuses follow later updates', async ($, on) => {
+    const files: Record<string, string> = {}
+    const { toasts } = world(on, files)
+    builtins(on)
+    await $.session.start(START)
+    await $.tool.call(todos(['Read the code', 'in_progress'], ['Fix the bug', 'pending'], ['Run the tests', 'pending']) as never)
+    expect(planFiles(files).length).toBe(1)
+    expect(steps(files)).toEqual([
+      ['t1', 'Read the code', 'doing', '', 'auto'],
+      ['t2', 'Fix the bug', 'todo', 't1', 'auto'],
+      ['t3', 'Run the tests', 'todo', 't2', 'auto'],
+    ])
+    expect(toasts.filter(x => x === MADE).length).toBe(1)
+    await $.tool.call(todos(['Read the code', 'completed'], ['Fix the bug', 'in_progress'], ['Run the tests', 'pending'], ['Write the notes', 'pending']) as never)
+    expect(planFiles(files).length).toBe(1)
+    expect(steps(files).map(s => [s[0], s[2], s[3]])).toEqual([
+      ['t1', 'done', ''],
+      ['t2', 'doing', 't1'],
+      ['t3', 'todo', 't2'],
+      ['t4', 'todo', 't3'],
+    ])
+    expect(toasts.filter(x => x === MADE).length).toBe(1)
+    // 子代理的待辦清單不算
+    await $.tool.call({ ...todos(['Read the code', 'pending'], ['x', 'pending'], ['y', 'pending']), agentId: 'ag1' } as never)
+    expect(steps(files)[0]![2]).toBe('done')
+  })
+
+  test('TaskCreate / TaskUpdate: the plan starts at the third open task, later tasks join it, a deleted task is dropped', async ($, on) => {
+    const files: Record<string, string> = {}
+    world(on, files)
+    builtins(on)
+    await $.session.start(START)
+    const create = (subject: string) => $.tool.call({ tool: 'TaskCreate', subject, description: subject } as never)
+    await create('Plan')
+    await create('Build')
+    expect(planFiles(files).length).toBe(0)
+    await create('Test')
+    expect(planFiles(files).length).toBe(1)
+    await create('Ship')
+    await $.tool.call({ tool: 'TaskUpdate', taskId: '1', status: 'in_progress' } as never)
+    await $.tool.call({ tool: 'TaskUpdate', taskId: '2', status: 'deleted' } as never)
+    expect(planFiles(files).length).toBe(1)
+    expect(steps(files).map(s => [s[0], s[1], s[2], s[3]])).toEqual([
+      ['t1', 'Plan', 'doing', ''],
+      ['t2', 'Build', 'dropped', 't1'],
+      ['t3', 'Test', 'todo', 't2'],
+      ['t4', 'Ship', 'todo', 't3'],
+    ])
+  })
+
+  test('a bound plan: no second plan; only steps with the same title follow the list', async ($, on) => {
+    const files: Record<string, string> = {}
+    const { toasts } = world(on, files)
+    builtins(on)
+    await $.session.start(START)
+    await $.tool.call({ tool: TOOL, op: 'new_plan', title: 'Mine', nodes: [{ id: 'a', title: 'Fix the bug' }, { id: 'b', title: 'Ship it', deps: ['a'] }] })
+    await $.tool.call(todos(['Fix the bug', 'completed'], ['Something else', 'in_progress'], ['Another', 'pending']) as never)
+    expect(planFiles(files).length).toBe(1)
+    expect(steps(files).map(s => [s[0], s[2]])).toEqual([
+      ['a', 'done'],
+      ['b', 'todo'],
+    ])
+    expect(toasts).not.toContain(MADE)
+  })
+
+  test('autoPlan off: the to-do list never opens a plan', { options: { autoPlan: false } }, async ($, on) => {
+    const files: Record<string, string> = {}
+    world(on, files)
+    builtins(on)
+    await $.session.start(START)
+    await $.tool.call(todos(['a', 'pending'], ['b', 'pending'], ['c', 'pending']) as never)
+    expect(planFiles(files).length).toBe(0)
+  })
+
+  test('a turn of real work with no plan shows "Use /workflow" once per session, gone at the next turn', async ($, on) => {
+    world(on, {})
+    builtins(on)
+    on('turn.complete', () => ({ text: '' }))
+    on('turn.start', ($, e) => ({ turnId: e.turnId }))
+    on('ui.render', ($, e) => {
+      const { Box } = $.ui.resolve(e)
+      return <Box />
+    })
+    await $.session.start(START)
+    const turn = async (id: string, calls: number) => {
+      await $.turn.start({ text: 'go', turnId: id } as never)
+      for (let i = 0; i < calls; i++) await $.tool.call({ tool: i % 2 ? 'Edit' : 'Bash', command: 'x' } as never)
+      await $.turn.complete({ reason: 'answer', answer: 'ok', turnId: id } as never)
+    }
+    const hint = async () => {
+      const ui = await $.ui.mount({ plugin: 'workflow-map', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+      const found = await ui.find({ type: 'Text', text: 'Use /workflow to start a plan' })
+      await ui.unmount()
+      return !!found
+    }
+    await turn('t1', 2)
+    expect(await hint()).toBe(false) // 少於 3 次
+    await turn('t2', 3)
+    expect(await hint()).toBe(true)
+    await $.turn.start({ text: 'next', turnId: 't3' } as never)
+    expect(await hint()).toBe(false)
+    await $.turn.complete({ reason: 'answer', answer: 'ok', turnId: 't3' } as never)
+    await turn('t4', 5)
+    expect(await hint()).toBe(false) // 每個 session 一次
+  })
+})
+
+describe('terminal (CLI)', () => {
+  type El = { type?: string; text?: string; props: Record<string, unknown>; children?: El[] }
+  const cellsOf = (x: string) => [...x].reduce((n, c) => n + (/[⺀-鿿가-힯豈-﫿︰-﹏＀-｠￠-￦]/.test(c) ? 2 : 1), 0)
+  const txt = (e: El | string | null | undefined): string => (typeof e === 'string' ? e : !e ? '' : (e.children ?? []).map(txt).join(''))
+  const graphLines = async (ui: { find: (q: { key: string }) => Promise<unknown> }) =>
+    (((await ui.find({ key: 'graph' })) as El | undefined)?.children ?? []).filter(Boolean).map(txt)
+  const band = (cols = 100) => ({ ...(BAND_PROPS as object), bodyColumns: cols }) as never
+
+  test('title row: status glyph in the theme colour, bold name, block bar coloured per status, count; e / f hotkeys; no Svg', async ($, on) => {
+    world(on, {})
+    await $.session.start(START)
+    await $.tool.call({ tool: TOOL, op: 'set_plan', nodes: plan().nodes.map(({ id, title, status, deps }) => ({ id, title, status, deps })) })
+    const ui = await $.ui.mount({ plugin: 'workflow-map', surface: 'terminal', component: 'AbovePrompt', props: band() })
+    const texts = await ui.findAll({ type: 'Text' })
+    expect(texts.find(x => x.text === '◉')?.props.color).toBe('claude')
+    expect(texts.find(x => x.text === '寫 API')?.props.bold).toBe(true)
+    expect(texts.find(x => x.text === '1/4')?.props.bold).toBe(true)
+    const bar = texts.filter(x => /^━+$/.test(x.text))
+    expect(bar.map(x => x.props.color)).toEqual(['success', 'claude', 'subtle', 'subtle'])
+    expect((await ui.findAll({ type: 'Button' })).map(b => [b.props.hotkey, b.text])).toEqual([
+      ['e', '展開'],
+      ['f', '全圖'],
+    ])
+    expect(await ui.findAll({ type: 'Svg' })).toEqual([])
+    await ui.unmount()
+  })
+
+  test('expanded: rounded cards joined by ─── at the first row (├───┤), done chip first, no dangling link, within the width', async ($, on) => {
+    world(on, {})
+    await $.session.start(START)
+    await $.tool.call({ tool: TOOL, op: 'set_plan', nodes: plan().nodes.map(({ id, title, status, deps }) => ({ id, title, status, deps })) })
+    const ui = await $.ui.mount({ plugin: 'workflow-map', surface: 'terminal', component: 'AbovePrompt', props: band() })
+    await ui.press({ key: 'toggle' })
+    const lines = await graphLines(ui)
+    expect(lines[0]!.startsWith('╭')).toBe(true)
+    expect(lines[1]).toMatch(/^│ ✓ 1 已完成 ├───┤ ◉ 寫 API +.*├───┤ ○ 整合測試 +│$/) // 最後一張卡後面沒有線
+    expect(lines.join('')).not.toContain('┄')
+    for (const l of lines) expect(cellsOf(l)).toBeLessThanOrEqual(99)
+    // 每張卡都完整（上下框成對）
+    const all = lines.join('\n')
+    expect((all.match(/╭/g) ?? []).length).toBe((all.match(/╯/g) ?? []).length)
+    await ui.unmount()
+  })
+
+  test('narrow terminal: steps that do not fit fold into a dashed "+N later" card; never a card cut in half', async ($, on) => {
+    world(on, {})
+    await $.session.start(START)
+    await $.command.run({ command: 'workflow-demo', args: '', origin: { kind: 'composer' } } as never)
+    const ui = await $.ui.mount({ plugin: 'workflow-map', surface: 'terminal', component: 'AbovePrompt', props: band(64) })
+    await ui.press({ key: 'toggle' })
+    const lines = await graphLines(ui)
+    expect(lines[1]).toMatch(/┄┄┄┤ \+\d+ later ┆$/)
+    for (const l of lines) expect(cellsOf(l)).toBeLessThanOrEqual(63)
+    const all = lines.join('\n')
+    expect((all.match(/╭/g) ?? []).length).toBe((all.match(/╯/g) ?? []).length)
+    // 幽靈卡是淡色
+    const ghostText = (await ui.findAll({ type: 'Text' })).find(x => /^\+\d+ later$/.test(x.text))
+    expect(ghostText?.props.dimColor).toBe(true)
+    await ui.unmount()
+  })
+
+  test('all done: only the done chip, no link or port', async ($, on) => {
+    world(on, {})
+    await $.session.start(START)
+    await $.tool.call({ tool: TOOL, op: 'set_plan', nodes: plan().nodes.map(({ id, title, deps }) => ({ id, title, deps, status: 'done' })) })
+    const ui = await $.ui.mount({ plugin: 'workflow-map', surface: 'terminal', component: 'AbovePrompt', props: band() })
+    await ui.press({ key: 'toggle' })
+    const lines = await graphLines(ui)
+    expect(lines).toEqual(['╭────────────╮', '│ ✓ 4 已完成 │', '╰────────────╯'])
+    await ui.unmount()
+  })
+
+  test('full view: block bar in the header, ▸ section toggles, cards without blank rows, ─ dividers, inserted step in the theme violet', async ($, on) => {
+    world(on, {})
+    await $.session.start(START)
+    await $.command.run({ command: 'workflow-demo', args: '', origin: { kind: 'composer' } } as never)
+    const ui = await $.ui.mount({ plugin: 'workflow-map', surface: 'terminal', component: 'Pane', requestId: 'workflow-map', props: { title: 'x', isFocused: false, bodyColumns: 72 } as never })
+    const texts = await ui.findAll({ type: 'Text' })
+    expect(texts.filter(x => /^━+$/.test(x.text)).length).toBeGreaterThan(0)
+    expect((await ui.find({ key: 'fold-done' }))?.text).toBe('▸ Done 5')
+    const cards = (await ui.findAll({ type: 'Box' })).filter(b => b.props.borderStyle === 'round')
+    for (const c of cards) expect([c.props.paddingX, c.props.paddingY, c.props.borderColor]).toEqual([1, 0, 'subtle'])
+    // 分隔線剛好是卡內的闊度（72 − 內距 1 − 框 2 − 內距 2 = 67）
+    const rules = texts.filter(x => /^─+$/.test(x.text))
+    expect(rules.length).toBeGreaterThan(0)
+    for (const r of rules) expect(r.text.length).toBe(67)
+    expect(texts.find(x => x.text === '◇')?.props.color).toBe('claude') // 插入而且進行中
+    expect(texts.find(x => x.text === 'Follow the system light/dark' || /Follow the system/.test(x.text))?.props.color).toBe('merged')
+    expect(await ui.findAll({ type: 'Svg' })).toEqual([])
     await ui.unmount()
   })
 })

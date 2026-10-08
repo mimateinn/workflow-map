@@ -1,6 +1,6 @@
 {
   "name": "workflow-map",
-  "version": "0.3.4",
+  "version": "0.4.0",
   "description": "Live workflow map: one row above the prompt (what is running, what is next, segmented progress) that expands into a card graph of parallel steps, plus a full stage-by-stage view, with your mid-plan interjections clearly marked, owners and timing per step, sub-agent sync and plan history.",
   "author": {
     "name": "mimateinn"
@@ -8,6 +8,12 @@
   "license": "MIT",
   "types": "./types/index.d.ts",
   "userConfig": {
+    "autoPlan": {
+      "type": "boolean",
+      "title": "Keep a plan automatically",
+      "description": "Tell Claude to start and keep a plan for any task of 3 or more steps, and turn Claude's own to-do list into a plan when it forgets. Off: Claude only gets a one-line note and uses the plan when you ask.",
+      "default": true
+    },
     "notify": {
       "type": "boolean",
       "title": "Notifications",

@@ -74,7 +74,9 @@ To try it without a real plan, run `/workflow-demo` (shows a sample; run it agai
 
 ## How it works
 
-- The plugin gives Claude a `workflow_map` tool (`new_plan` / `set_plan` / `upsert` / `status` / `insert` / `remove` / `show`) plus a short system-prompt note (about 80 words): keep the map current for work of more than three steps, start a `new_plan` for an unrelated task, record your mid-plan requests with `insert` first, and tag delegated agents with `[wm:<id>]`. Tool answers are kept short — a one-line summary plus the steps that changed — so the map costs few tokens.
+- **No CLAUDE.md edits needed.** Once installed, the plugin itself tells Claude to keep the plan: it gives Claude a `workflow_map` tool (`new_plan` / `set_plan` / `upsert` / `status` / `insert` / `remove` / `show`) and adds a short rule to every session's system prompt (under 110 words): for any task of 3 or more steps start a `new_plan`, keep statuses current (doing / done / blocked), record your mid-plan requests with `insert` before acting on them, tag delegated agents with `[wm:<step id>]`, and write titles in your language. Tool answers are kept short — a one-line summary plus the steps that changed — so the map costs few tokens.
+- **Safety net:** if Claude forgets and uses its own to-do list instead (`TodoWrite`, or `TaskCreate` / `TaskUpdate`), a session with no plan gets one built from that list (3 or more open items; steps in order, owner `auto`; a one-time notice says so), and later to-do updates keep the step statuses in sync. A session that already has a plan never gets a second one; only steps whose titles match a to-do item follow it. After a turn with real work (3 or more edits or commands) and still no plan, the band shows a one-line hint, once per session.
+- Turn all of this off with `autoPlan: false`: Claude then gets only a one-line note and uses the plan when you ask for one.
 - The map is stored in your project at **`.claude/workflow-map.json`**, so later sessions and other agents can read it. Updates that would create a cycle or point to a missing step are rejected and the map is left unchanged. A damaged file is backed up before the map restarts.
 - **Safe with other writers:** before writing, the plugin reads the file again and merges step by step (the newer change wins; deleted steps stay deleted), so a Codex or Grok session editing the same plan doesn't lose its changes. The format, merge rules and history folder are documented in **[docs/FORMAT.md](docs/FORMAT.md)** for tools that want to read or write the plan.
 - **History:** finished or replaced plans are kept in `.claude/workflow-map.history/`, one file per plan; the full view lists them under **History**. Files from older versions are backed up once and upgraded in place, never trimmed.
@@ -86,13 +88,29 @@ To try it without a real plan, run `/workflow-demo` (shows a sample; run it agai
 - `/workflow export` and `/workflow undo` do the same as the **Export** and **Undo** buttons; `/workflow join <id or title>` and `/workflow leave` switch this session's plan.
 - **Upgrading from 0.3.0:** the old shared file `.claude/workflow-map.json` is left exactly as it is and becomes the plan called `default`; a session sees it only after joining it.
 - `/workflow` — open the full map (registered as `/workflow-map` if another plugin already owns `/workflow`). `/workflow-demo` — toggle a sample map (on screen only, nothing is written).
-- In the terminal the map is drawn as text (a one-line summary that expands into a step list).
+- In the terminal (Claude Code CLI) the same band and full view are drawn with text characters — see **Terminal (CLI)** below.
 - The map hides when there is no plan, and hides itself again shortly after everything is done.
+
+## Terminal (CLI)
+
+The plugin is a first-class terminal app too. Everything is drawn with text characters in your terminal theme's own colours, so it fits light and dark themes:
+
+- **Band:** a coloured status glyph (✓ done, ◉ in progress, ○ not started, ! blocked, ◇ added by you), the running step, "Next: …", a progress bar of `━` segments coloured per step, the count and the time left.
+- **Expand** draws the card graph as rounded boxes joined by `───`: finished work folds into "✓ N done", parallel steps share a card with owner · time, and whatever doesn't fit the width folds into a dashed `+N later` card at the end of the line. A card is never cut in half and no line is left hanging.
+- **Keys:** press **ctrl+x tab** to put the focus on the band, then **e** expands or collapses and **f** opens the full view. Suggestions are picked with **1 / 2 / 3**, and **0** hides them.
+- **Full view** (`/workflow`) docks on the right when the terminal is wide enough. It has the same sections, stage cards with `─` dividers, Details, Help (with the language menu), Plans and Projects.
+
+![Claude Code in a terminal: the expanded band](docs/terminal-band.png)
+
+![Claude Code in a terminal: band and full view](docs/terminal.png)
+
+<sub>Captured from the real Claude Code CLI 2.1.293 running the demo plan (`/workflow-demo`) in a 150 × 42 terminal, then drawn to an image cell by cell.</sub>
 
 ## Options
 
 | Option | Values | Default |
 |---|---|---|
+| `autoPlan` | `true`, `false` | `true` (Claude starts and keeps a plan for any task of 3+ steps; its to-do list becomes a plan when it forgets) |
 | `language` | `auto`, `en`, `zh-Hant`, `ja`, `ko`, `es`, `fr`, `de` | `auto` (script of your latest prompt; English when unsure) |
 | `suggestions` | `true`, `false` | `true` (next-prompt suggestions as the band's last row) |
 | `notify` | `true`, `false` | `true` (notifications for finished, blocked and stale steps) |
@@ -127,6 +145,10 @@ The next-prompt suggestions are derived from [next-steps](https://github.com/ant
 ## 繁體中文
 
 **workflow-map** 在 Claude Code 輸入框上方以一行顯示目前工作：正在做甚麼、下一步、分段進度條。按 ˅ 展開成卡片圖（已完成收成「✓ N 已完成」、並行步驟疊在同一張卡）；輸入 `/workflow` 開啟全圖。你中途提出的要求會先以紫色菱形 ◇ 記錄下來，不會被遺忘。每一步可標示負責人（Builder、Grok、me…）和用時；派子代理時在描述寫 `[wm:<步驟 id>]`，步驟會自動變成進行中、完成（或出錯時受阻）；進行中超過 30 分鐘沒有更新會變琥珀色（「久未更新」，可用 `staleMinutes` 調整）。全圖每一步按「詳情」可看：你的原話、等待／完成後可開始的步驟、負責人、時間、狀態紀錄。開始另一件工作時，舊計劃移到「歷史紀錄」。資料只存於專案的 `.claude/workflow-map.json` 和 `.claude/workflow-map.history/`，不連網；檔案格式見 [docs/FORMAT.md](docs/FORMAT.md)（英文），其他工具（Codex、Grok）可按規則安全地一同讀寫。子代理完成、步驟受阻或久未更新時會彈出簡短通知（`notify` 可關）；有三個以上已完成步驟有時間時顯示估計剩餘時間（≈ 40 分鐘）；`/workflow export`（或全圖的「匯出」）把計劃寫成 Markdown 並複製；`/workflow undo`（或「還原」）還原上一次修改；「專案」列出其他有計劃的專案，可唯讀查看。每個工作階段有自己的計劃，同一個專案的兩個工作階段互不干擾；想一起用同一份計劃，在全圖按「計劃」→「加入」（或 `/workflow join <標題>`），`/workflow leave` 離開。舊版的共用檔 `.claude/workflow-map.json` 原封不動，成為名叫 `default` 的計劃，加入了才會看見。每次回答後，橫條最後一行會建議最多三句下一步（計劃中可開始的步驟優先），按 1／2／3 放入輸入框（不會自動送出），0 收起；可用 `suggestions` 關閉。介面語言跟隨你最近一次輸入的文字（繁中、日文、韓文，其餘英文；簡體用英文介面），亦可在設定 `language` 指定英文、繁中、日文、韓文、西班牙文、法文或德文。建議功能改編自 Anthropic 的 next-steps（Apache-2.0，見 NOTICE）。
+
+**終端機（CLI）：**同樣的橫條和全圖，用文字字元畫，顏色跟你的終端機主題：狀態符號（✓ ◉ ○ ! ◇）、`━` 分段進度條、圓角卡片以 `───` 相連、放不下的收成虛線「+N 稍後」卡。按 **ctrl+x tab** 讓橫條取得焦點，**e** 展開／收起，**f** 開全圖；全圖在終端機夠闊時停靠在右邊。
+
+**運作方式：**裝好就生效，不用改 CLAUDE.md。外掛自己會在每個工作階段的系統提示加一段簡短規則（110 字以內），叫 Claude：三步以上的工作一開始就 `new_plan`、做的時候更新狀態（進行中／完成／受阻）、你中途加的要求先用 `insert` 記下再做、派子代理時在描述寫 `[wm:<步驟 id>]`、步驟名稱用你的語言。萬一 Claude 忘了開計劃而用了自己的待辦清單（`TodoWrite` 或 `TaskCreate`／`TaskUpdate`），沒有計劃的工作階段會照清單自動建立一個（3 項以上未完成；按次序、負責人 `auto`，並通知一次「已根據待辦清單建立工作流程」），之後清單更新時同步狀態；已有計劃就不會另開，只同步名稱相同的步驟。做了不少工作（一輪內 3 次以上改檔或執行指令）仍未有計劃，橫條會提示一行「可用 /workflow 開始計劃」，每個工作階段只一次。不想要這些：設定 `autoPlan` 為 `false`，Claude 只會收到一句簡短說明，你要求時才用計劃。
 
 安裝（需要 Claude Code 2.1.287 或以上）：
 

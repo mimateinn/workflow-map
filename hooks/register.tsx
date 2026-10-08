@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderChildren, UiPressArgument } from 'claude-code'
 
-import type { WorkflowMap, WorkflowNode } from '../types/index'
+import type { TodoItem, TodoMirror, WorkflowMap, WorkflowNode } from '../types/index'
 import { demoMap as demoPlan } from './demo'
 import { allDone, applyOp, compactLine, emptyMap, etaMin, exportMarkdown, findCycle, isActive, isStale, mergeMaps, migrate, opSummary, plainLines, readyIds, STATUSES, stageView, stats, textDiagram, validateMap } from './graph'
 import type { Op } from './graph'
@@ -9,6 +9,8 @@ import { detectLang, HELP_TABS, LANGS, looksLikeRequest, resolveLang, STR } from
 import type { Lang } from './i18n'
 import { CAPSULE_CELLS, CAPSULE_CHROME, cells, fitCells, forkPrompt, languageRule, MAX_SUGGESTIONS, MIN_ANSWER_CHARS, parseSuggestions, planSuggestions, ROW_CHROME, sameAs, skillList } from './suggest'
 import type { Suggestion, SuggestView } from './suggest'
+import { bandCards, barSegs, glyph, headerSegs } from './tui'
+import type { Seg } from './tui'
 import { amberPic, bandGraph, bandHeader, chevronPic, detailLines, fmtTime, iconPic, kindOf, metaOf, miniBar, paneBar, paneCards, paneStatus, PX_PER_COL, slotPic, STAR_W, starPic, THEMES } from './svg'
 import type { Clock, Kind } from './svg'
 
@@ -104,6 +106,17 @@ const HELP_LANG = atom({ plugin: 'workflow-map', key: 'helpLang' } as const, '')
 const SUGGEST = atom({ plugin: 'workflow-map', key: 'suggest' } as const, { kind: 'hidden' } as SuggestView)
 /** 子代理 id → 它負責的步驟 id（由描述內的 [wm:<id>] 得知） */
 const AGENTS = atom({ plugin: 'workflow-map', key: 'agents' } as const, {} as Record<string, string>)
+/** 模型內建待辦清單的鏡像（項目 → 步驟；由清單自動開的計劃 id） */
+const TODOS = atom({ plugin: 'workflow-map', key: 'todos' } as const, { items: [], plan: '' } as TodoMirror)
+let todoChain: Promise<unknown> = Promise.resolve()
+/** 待辦清單至少幾項（未完成）才自動開計劃：與指引的「3 步以上」一致 */
+const AUTO_MIN = 3
+const TODO_STATUS: Record<string, WorkflowNode['status']> = { pending: 'todo', in_progress: 'doing', completed: 'done', deleted: 'dropped' }
+/** 算作「實際工作」的工具；本輪主對話做了 NUDGE_AFTER 次而仍未有計劃 → 提示一次 */
+const WORK_TOOLS = ['Edit', 'Write', 'NotebookEdit', 'Bash', 'PowerShell'] as const
+const NUDGE_AFTER = 3
+const WORK = atom({ plugin: 'workflow-map', key: 'work' } as const, 0)
+const NUDGE = atom({ plugin: 'workflow-map', key: 'nudge' } as const, 0)
 /** 每分鐘跳一次（有進行中的步驟時），令用時與「久未更新」刷新 */
 const TICK = atom({ plugin: 'workflow-map', key: 'tick' } as const, 0)
 const WM_TAG = /\[wm:([^\]\s]+)\]/
@@ -164,13 +177,16 @@ const SCHEMA = {
   required: ['op'],
 }
 
-// 每次對話都會帶上：保持 ≤ ~80 字
+// 每次對話都會帶上（裝了外掛就有，用戶不用改 CLAUDE.md）：保持 ≤ ~110 字。autoPlan = false 時只帶 GUIDE_MIN。
 const GUIDE =
-  `# Workflow map\nThe map is this session's own plan. For work with 3+ steps keep it current with ${TOOL}: new_plan at the start ` +
-  '(honest deps: independent steps share none), status doing/done as you go, new_plan again for an unrelated task. ' +
-  'If the user asks for something not in the plan, first insert it (note = their words; before = steps that must wait), then act. ' +
-  'When delegating a step, set its owner and put [wm:<id>] in the Agent description; the step then syncs with that agent. ' +
-  "Titles: the user's language, ≤ 8 CJK / 20 Latin characters, plain words."
+  `# Workflow map\nThis session has its own plan, shown live to the user. For any task with 3+ steps:\n` +
+  `- At the start, call ${TOOL} new_plan (honest deps: independent steps share none).\n` +
+  '- Keep statuses current as you work: doing when a step starts, done or blocked when it ends.\n' +
+  '- When the user adds a request mid-plan, record it with insert (note = their words) BEFORE acting on it.\n' +
+  '- When delegating a step to a sub-agent, put [wm:<step id>] in its description.\n' +
+  "- Titles in the user's language, plain words, no jargon, ≤ 8 CJK / 20 Latin characters.\n" +
+  '- An unrelated new task: new_plan again.'
+const GUIDE_MIN = `# Workflow map\n${TOOL} shows a plan to the user. Use it only when the user asks for one; then keep statuses current. Titles in the user's language.`
 
 const HINT =
   `[workflow-map] A plan is in progress. If this message asks for something not already in the plan, record it first with ${TOOL} op "insert".`
@@ -194,6 +210,8 @@ let languageSetting: unknown = 'auto'
 let suggestionsOn = true
 /** userConfig `notify`：子代理完成、步驟受阻、久未更新時彈通知（預設開） */
 let notifyOn = true
+/** userConfig `autoPlan`：系統提示叫模型 3 步以上就開計劃、並由待辦清單自動開計劃（預設開；關 = 只帶最簡短的說明） */
+let autoPlanOn = true
 /** 同一時間內的通知合併：第一則之後等 NOTIFY_BATCH_MS，期間的全部合成一則 */
 const NOTIFY_BATCH_MS = 5000
 /** 已通知過的「步驟 × 轉變」（每步每種轉變最多一則；離開那個狀態後可再通知） */
@@ -423,10 +441,98 @@ async function joinPlan($: $, ref: string): Promise<string> {
 
 const openPane = ($: $, lang: Lang) => $.ui.open({ id: PANE, title: STR[lang].paneTitle })
 
+/**
+ * 待辦清單 → 計劃。TodoWrite 每次給整張清單（以內容對照）；TaskCreate／TaskUpdate 逐項（以 task id 對照）。
+ * 未綁定計劃：清單有 AUTO_MIN 項以上未完成 → 開一個（步驟依次序；Task 工具給了 blockedBy 就照用），負責人 auto，通知一次。
+ * 已綁定：只同步標題相同（或已對照過）的步驟的狀態；由清單自動開的計劃才會加入清單新增的項目。
+ */
+async function mirrorTodos($: $, e: Record<string, unknown>, result: unknown) {
+  const prev = await read($, TODOS)
+  const strs = (v: unknown) => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [])
+  let items: TodoItem[]
+  if (e.tool === 'TodoWrite') {
+    if (!Array.isArray(e.todos)) return
+    items = (e.todos as { content?: unknown; status?: unknown }[])
+      .filter(x => typeof x?.content === 'string' && x.content.trim())
+      .map(x => {
+        const title = String(x.content).trim()
+        return { key: title, title, status: String(x.status ?? 'pending'), blockedBy: [], step: prev.items.find(p => p.key === title)?.step }
+      })
+  } else if (e.tool === 'TaskCreate') {
+    const id = (result as { task?: { id?: unknown } } | undefined)?.task?.id
+    const title = typeof e.subject === 'string' ? e.subject.trim() : ''
+    if (typeof id !== 'string' || !title) return
+    items = [...prev.items, { key: id, title, status: 'pending', blockedBy: [] }]
+  } else {
+    const id = String(e.taskId ?? '')
+    items = prev.items.map(p =>
+      p.key === id
+        ? {
+            ...p,
+            title: typeof e.subject === 'string' && e.subject.trim() ? e.subject.trim() : p.title,
+            status: typeof e.status === 'string' ? e.status : p.status,
+            blockedBy: [...new Set([...p.blockedBy, ...strs(e.addBlockedBy)])],
+          }
+        : strs(e.addBlocks).includes(p.key)
+          ? { ...p, blockedBy: [...new Set([...p.blockedBy, id])] }
+          : p,
+    )
+  }
+  let plan = prev.plan
+  const bound = await read($, BOUND)
+  const live = items.filter(i => i.status !== 'deleted')
+  // 步驟的 deps：Task 工具給了依賴就照用（沒有依賴的項目並行），否則按清單次序
+  const depsOf = (i: TodoItem, before: string | undefined, stepOf: (key: string) => string | undefined) =>
+    live.some(x => x.blockedBy.length) ? i.blockedBy.map(stepOf).filter((x): x is string => !!x) : before ? [before] : []
+  if (!bound) {
+    if (!autoPlanOn || live.filter(i => i.status !== 'completed').length < AUTO_MIN) return void (await update($, TODOS, () => ({ items, plan })))
+    const steps = new Map(live.map((i, k) => [i.key, `t${k + 1}`]))
+    const nodes = live.map((i, k) => ({
+      id: steps.get(i.key)!,
+      title: i.title,
+      status: TODO_STATUS[i.status] ?? 'todo',
+      owner: 'auto',
+      deps: depsOf(i, k ? steps.get(live[k - 1]!.key) : undefined, key => steps.get(key)),
+    }))
+    const r = await applyAndWrite($, { op: 'new_plan', title: live[0]!.title, nodes } as Op, 'auto')
+    if ('error' in r) return void (await update($, TODOS, () => ({ items, plan })))
+    items = items.map(i => ({ ...i, step: steps.get(i.key) ?? i.step }))
+    plan = await read($, BOUND)
+    $.ui.toast(STR[await langNow($)].autoPlanMade)
+    return void (await update($, TODOS, () => ({ items, plan })))
+  }
+  const map = await loadMap($)
+  const byId = new Map(map.nodes.map(n => [n.id, n]))
+  const byTitle = new Map(map.nodes.map(n => [n.title.trim(), n.id]))
+  items = items.map(i => ({ ...i, step: i.step && byId.has(i.step) ? i.step : byTitle.get(i.title) }))
+  const own = bound === plan
+  const nodes: { id: string; title?: string; status: WorkflowNode['status']; owner?: string; deps?: string[] }[] = []
+  let n = map.nodes.length
+  let before: string | undefined
+  for (const i of items) {
+    if (i.status === 'deleted') {
+      // 刪除：只在清單自己開的計劃上標「放棄」
+      if (own && i.step && byId.get(i.step)?.status !== 'dropped') nodes.push({ id: i.step, status: 'dropped' })
+      continue
+    }
+    const want = TODO_STATUS[i.status] ?? 'todo'
+    if (!i.step && own) {
+      while (byId.has(`t${++n}`));
+      i.step = `t${n}`
+      byId.set(i.step, { id: i.step, title: i.title, status: want, deps: [] })
+      nodes.push({ id: i.step, title: i.title, status: want, owner: 'auto', deps: depsOf(i, before, key => items.find(x => x.key === key)?.step) })
+    } else if (i.step && byId.get(i.step)?.status !== want) nodes.push({ id: i.step, status: want })
+    before = i.step ?? before
+  }
+  await update($, TODOS, () => ({ items, plan }))
+  if (nodes.length) await applyAndWrite($, { op: 'upsert', nodes } as Op, 'auto')
+}
+
 export const register: Register = (on, options) => {
   languageSetting = (options as { language?: unknown } | undefined)?.language ?? 'auto'
   suggestionsOn = (options as { suggestions?: unknown } | undefined)?.suggestions !== false
   notifyOn = (options as { notify?: unknown } | undefined)?.notify !== false
+  autoPlanOn = (options as { autoPlan?: unknown } | undefined)?.autoPlan !== false
   const stale = Number((options as { staleMinutes?: unknown } | undefined)?.staleMinutes ?? 30)
   staleMinutes = Number.isFinite(stale) && stale >= 0 ? stale : 30
 
@@ -500,7 +606,27 @@ export const register: Register = (on, options) => {
   on('prompt.compose', async ($, e, next) => {
     const r = await next(e)
     if (!e.tools.includes(TOOL)) return r
-    return { sections: [...r.sections, { id: 'workflow-map:guide', text: GUIDE, scope: 'session' as const }] }
+    return { sections: [...r.sections, { id: 'workflow-map:guide', text: autoPlanOn ? GUIDE : GUIDE_MIN, scope: 'session' as const }] }
+  })
+
+  // 安全網（模型忘了開計劃）：主對話用內建待辦清單（TodoWrite／TaskCreate／TaskUpdate）→ 鏡像成計劃並同步狀態。
+  // 一次只處理一個（同一則回覆內的幾個 TaskCreate 不會互相蓋掉）。
+  on('tool.call', { tool: ['TodoWrite', 'TaskCreate', 'TaskUpdate'] }, async ($, e, next) => {
+    const r = await next(e)
+    if (e.agentId === undefined && r.result !== undefined && !r.isError) {
+      const input = e as unknown as Record<string, unknown>
+      const job = todoChain.then(() => mirrorTodos($, input, r.result))
+      todoChain = job.catch(() => undefined)
+      await todoChain
+    }
+    return r
+  })
+
+  // 主對話的實際工作（改檔、執行指令）：數本輪次數，給「可用 /workflow」提示
+  on('tool.call', { tool: WORK_TOOLS }, async ($, e, next) => {
+    const r = await next(e)
+    if (e.agentId === undefined && r.result !== undefined) await update($, WORK, n => n + 1)
+    return r
   })
 
   // 安全網：計劃進行中用戶再發訊息 → 標示「未記錄」並提示模型一句；不自動新增步驟。
@@ -523,8 +649,10 @@ export const register: Register = (on, options) => {
   on('turn.start', async ($, e, next) => {
     const now = await $.clock.now()
     await update($, TURN_AT, () => now)
-    // 新一輪開始：收起上一輪的建議
+    // 新一輪開始：收起上一輪的建議和提示，重新數工作次數
     if ((await read($, SUGGEST)).kind !== 'hidden') await update($, SUGGEST, () => ({ kind: 'hidden' }) as SuggestView)
+    if ((await read($, NUDGE)) === 1) await update($, NUDGE, () => 2)
+    await update($, WORK, () => 0)
     return next(e)
   })
 
@@ -567,6 +695,8 @@ export const register: Register = (on, options) => {
       if (await read($, PENDING)) await update($, PENDING, () => false)
       const done = allDone(await read($, MAP))
       await update($, DONE_TURNS, n => (done ? n + 1 : 0))
+      // 做了不少工作仍未有計劃：橫條提示一行（每個 session 一次）
+      if ((await read($, NUDGE)) === 0 && (await read($, WORK)) >= NUDGE_AFTER && !(await read($, BOUND))) await update($, NUDGE, () => 1)
     }
     const result = await next(e)
     // 主對話答完（夠長）：另開一條（fork）問「用戶下一句最可能說甚麼」，不阻住這一輪的完成
@@ -640,7 +770,8 @@ export const register: Register = (on, options) => {
     const map = await shownMap($)
     const showPlan = map.nodes.length > 0 && !(allDone(map) && (await read($, DONE_TURNS)) >= 2) // 全部完成後只顯示一輪
     const sv: SuggestView = suggestionsOn && !e.props.isWorking ? await read($, SUGGEST) : { kind: 'hidden' }
-    if (!showPlan && sv.kind === 'hidden') return next(e)
+    const nudge = !showPlan && (await read($, NUDGE)) === 1
+    if (!showPlan && sv.kind === 'hidden' && !nudge) return next(e)
     // 下面其他外掛的橫條照畫（在我們之上）
     let below: RenderChildren = null
     try {
@@ -656,10 +787,21 @@ export const register: Register = (on, options) => {
     const { Box, Text, Button } = table
     const Svg = e.surface !== 'terminal' && 'Svg' in table ? table.Svg : undefined
     const T = await themeOf($)
+    // 兩個控制；按鍵 e／f（終端機：ctrl+x tab 讓橫條取得焦點後按，按鈕畫成「e: 展開」）
     const controls = (
       <Box key="ctl" flexDirection="row" flexShrink={0} alignItems="center" gap={SPACE.GAP}>
-        <Button key="toggle" {...ICON_BTN} label={expanded ? t.collapseTip : t.expandTip} onPress={() => toggle($)} />
-        <Button key="open" {...ICON_BTN} label={t.openTip} onPress={() => openPane($, lang)} />
+        <Button key="toggle" {...ICON_BTN} hotkey="e" label={expanded ? t.collapseTip : t.expandTip} onPress={() => toggle($)} />
+        <Button key="open" {...ICON_BTN} hotkey="f" label={t.openTip} onPress={() => openPane($, lang)} />
+      </Box>
+    )
+    // 終端機：一段段帶主題色的字排成一行（不換行）
+    const segLine = (key: string, segs: readonly Seg[]) => (
+      <Box key={key} flexDirection="row" flexShrink={0}>
+        {segs.map(s => (
+          <Text color={s.color} dimColor={s.dim} bold={s.bold}>
+            {s.text}
+          </Text>
+        ))}
       </Box>
     )
 
@@ -717,18 +859,29 @@ export const register: Register = (on, options) => {
 
     let planRows: RenderChildren = null
     if (showPlan && !Svg) {
-      const all = plainLines(map, lang)
-      const shown = expanded ? all.slice(0, 6) : []
+      // 終端機版：標題行「◉ 名稱 +2  下一步：…   ━━ ━━ ━━  5/12 ≈ 1時  e: 展開  f: 全圖」→（展開時）字元畫的卡片圖
+      const cols = Math.max(40, e.props.bodyColumns || 100)
+      const view = stageView(map, { freshSince: await read($, TURN_AT) })
+      const clock = await clockOf($)
+      const etaM = etaMin(map, clock.now)
+      const ctlW = cells(expanded ? t.collapseTip : t.expandTip) + cells(t.openTip) + 3 * 2 + SPACE.GAP
+      const head = headerSegs(map, view, lang, clock, cols - ctlW - 2, pending, etaM === undefined ? '' : `≈ ${t.durShort(etaM)}`)
+      const g = expanded ? bandCards(map, view, lang, clock, cols - 1) : undefined
       planRows = [
-        <Box key="title" flexDirection="row" gap={1}>
-          <Box flexShrink={1} flexGrow={1}>
-            <Text wrap="truncate-end">{compactLine(map, lang)}</Text>
+        <Box key="title" flexDirection="row" alignItems="center">
+          <Box flexShrink={1} overflow="hidden">
+            {segLine('lead', head.left)}
           </Box>
-          {pending ? <Text color="warning">●</Text> : null}
+          <Box flexGrow={1} minWidth={2} />
+          {segLine('meter', head.right)}
+          <Box width={2} flexShrink={0} />
           {controls}
         </Box>,
-        ...shown.map(line => <Text wrap="truncate-end">{line}</Text>),
-        expanded && all.length > shown.length ? <Text dimColor>{t.laterCard(all.length - shown.length)}</Text> : null,
+        g ? (
+          <Box key="graph" flexDirection="column">
+            {g.lines.map((l, i) => segLine(`g${i}`, l))}
+          </Box>
+        ) : null,
       ]
     } else if (showPlan && Svg) {
       const view = stageView(map, { freshSince: await read($, TURN_AT) })
@@ -819,6 +972,11 @@ export const register: Register = (on, options) => {
         {below}
         <Box key="workflow-map" flexDirection="column">
           {planRows}
+          {nudge ? (
+            <Box key="nudge">
+              <Text dimColor>{t.nudge}</Text>
+            </Box>
+          ) : null}
           {suggestRow}
         </Box>
       </Box>
@@ -906,13 +1064,28 @@ export const register: Register = (on, options) => {
     const cards = paneCards(map, view, { lang, doneOpen: true, clock })
     const history = historyOpen && !foreign ? await readHistory($) : []
     const cols = (e.props as { bodyColumns?: number }).bodyColumns ?? 100
-    const GLYPHS: Record<string, string> = { done: '✓', doing: '●', stale: '●', ready: '○', todo: '○', blocked: '!' }
     const slot = Svg ? slotPic(T) : undefined
     const fill = Svg ? CARD_FILL[(await read($, LIGHT)) ? 'light' : 'dark'] : undefined
     const btn = (key: string, label: string, onPress: (press: UiPressArgument) => unknown) => <Button key={key} {...ICON_BTN} label={label} onPress={onPress} />
-    // 卡內行與行之間：app 自己的分隔線（Markdown 的 ---），沒有就不畫
+    const segLine = (key: string, segs: readonly Seg[]) => (
+      <Box key={key} flexDirection="row" flexShrink={0}>
+        {segs.map(x => (
+          <Text color={x.color} dimColor={x.dim} bold={x.bold}>
+            {x.text}
+          </Text>
+        ))}
+      </Box>
+    )
+    // 卡內行與行之間：app 自己的分隔線（Markdown 的 ---）；終端機的 Markdown 不畫成線，改用一行 ─（卡內闊 = 面板闊 − 內距 − 框）
     const Markdown = 'Markdown' in table ? table.Markdown : undefined
-    const divider = (key: string) => (Markdown ? <Markdown key={key} text="---" /> : null)
+    const divider = (key: string) =>
+      !Svg ? (
+        <Box key={key} flexShrink={0}>
+          <Text color="subtle">{'─'.repeat(Math.max(8, cols - PANE_INSET - 4))}</Text>
+        </Box>
+      ) : Markdown ? (
+        <Markdown key={key} text="---" />
+      ) : null
     // 圖示欄：桌面 20px 圖，終端機 1 個字；沒有圖示時是同闊的空位
     const iconCol = (k: Kind | undefined, ins: boolean, alt: string) =>
       Svg ? (
@@ -922,9 +1095,11 @@ export const register: Register = (on, options) => {
           <Svg source={slot!.source} alt="" width={ICON_COL} height={ICON_COL} />
         )
       ) : (
-        <Text color={k === 'doing' ? 'claude' : k === 'blocked' || k === 'stale' ? 'warning' : k === 'done' ? 'success' : undefined}>
-          {!k ? ' ' : ins ? '◇' : GLYPHS[k]}
-        </Text>
+        (g => (
+          <Text color={g.color} dimColor={g.dim} bold={g.bold}>
+            {g.text}
+          </Text>
+        ))(k ? glyph(k, ins) : { text: ' ' })
       )
     // 一行：[圖示欄][GAP][內容…]
     const line = (key: string, icon: RenderChildren, ...content: RenderChildren[]) => (
@@ -942,7 +1117,8 @@ export const register: Register = (on, options) => {
         borderStyle="round"
         borderColor={fill ? CARD_EDGE : 'subtle'}
         backgroundColor={fill}
-        padding={SPACE.PAD}
+        paddingX={SPACE.PAD}
+        paddingY={Svg ? SPACE.PAD : 0}
       >
         {children}
       </Box>
@@ -978,7 +1154,7 @@ export const register: Register = (on, options) => {
                 ? line(
                     'sub',
                     iconCol(undefined, false, ''),
-                    <Text dimColor={!r.n.inserted} color={r.n.inserted ? T.ins : undefined} wrap="truncate-end">
+                    <Text dimColor={!r.n.inserted} color={r.n.inserted ? (Svg ? T.ins : 'merged') : undefined} wrap="truncate-end">
                       {r.sub}
                     </Text>,
                   )
@@ -1034,7 +1210,7 @@ export const register: Register = (on, options) => {
       </Box>
     )
     // 說明卡的語言：app 原生的下拉選單（Select，如 app 自己的語言設定），選中的打 ✓；終端機用文字按鈕
-    const Select = e.surface !== 'terminal' && 'Select' in table ? table.Select : undefined
+    const Select = 'Select' in table ? table.Select : undefined
     // Select 沒有闊度屬性：包一個不會被壓的格，闊 = 最長的選項（CJK 算 2 格）+ 展開記號與內距
     const selectW = Math.max(...HELP_TABS.map(([, name]) => cells(name))) + 6
     const helpLangPicker = Select ? (
@@ -1073,9 +1249,30 @@ export const register: Register = (on, options) => {
         {banner}
         <Box key="head" flexDirection="row" alignItems="center" gap={SPACE.GAP}>
           {/* 進度條在可縮的格內（preserveAspectRatio none）：窄時縮條，不縮數字 */}
-          <Box flexGrow={1} flexShrink={1} overflow="hidden">
-            {Svg ? <Svg source={paneBar(map, T, 360).source} alt={t.progressTip(s.done, s.total)} height={20} /> : null}
+          <Box flexGrow={Svg ? 1 : 0} flexShrink={1} overflow="hidden">
+            {Svg ? (
+              <Svg source={paneBar(map, T, 360).source} alt={t.progressTip(s.done, s.total)} height={20} />
+            ) : (
+              // 終端機：字元進度條闊 = 這一行餘下的格數（數字、時間、狀態字之後），不會換行
+              segLine(
+                'bar',
+                barSegs(
+                  map,
+                  Math.min(
+                    40,
+                    cols -
+                      PANE_INSET -
+                      3 -
+                      cells(`${s.done} / ${s.total}`) -
+                      (paneEta === undefined ? 0 : 1 + cells(`≈ ${t.dur(paneEta)}`)) -
+                      (pending ? 2 : 0) -
+                      (cols >= 70 && status ? 1 + cells(status) : 0),
+                  ),
+                ),
+              )
+            )}
           </Box>
+          {Svg ? null : <Box flexGrow={1} />}
           <Box flexShrink={0}>
             <Text bold>{`${s.done} / ${s.total}`}</Text>
           </Box>
@@ -1178,7 +1375,7 @@ export const register: Register = (on, options) => {
           : null}
         {sections.map(sec => [
           <Box key={`sec:${sec.key}`} marginTop={SPACE.GAP} flexDirection="row" alignItems="center">
-            {sec.toggle ? btn(sec.toggle.key, Svg ? sec.label : `${sec.label} ${sec.toggle.open ? '⌃' : '⌄'}`, sec.toggle.onPress) : <Text dimColor>{sec.label}</Text>}
+            {sec.toggle ? btn(sec.toggle.key, Svg ? sec.label : `${sec.toggle.open ? '▾' : '▸'} ${sec.label}`, sec.toggle.onPress) : <Text dimColor>{sec.label}</Text>}
             {sec.toggle && Svg ? <Svg source={chevronPic(sec.toggle.open, T).source} alt={sec.toggle.open ? t.collapseTip : t.expandTip} width={14} height={20} /> : null}
           </Box>,
           ...sec.cards.map(c => stageCard(c, sec.key === 'done')),
@@ -1231,7 +1428,14 @@ export const register: Register = (on, options) => {
                     onPress={() => update($, VIEW_ROOT, () => (p.root === ownRoot ? '' : p.root))}
                   />,
                   <Box flexGrow={1} />,
-                  Svg ? <Svg source={miniBar(p.done, p.total, T).source} alt={`${p.done}/${p.total}`} width={60} height={20} /> : null,
+                  Svg ? (
+                    <Svg source={miniBar(p.done, p.total, T).source} alt={`${p.done}/${p.total}`} width={60} height={20} />
+                  ) : (
+                    segLine(`pbar-${i}`, [
+                      { text: '━'.repeat(Math.round((8 * p.done) / Math.max(1, p.total))), color: 'success' },
+                      { text: '━'.repeat(8 - Math.round((8 * p.done) / Math.max(1, p.total))), color: 'subtle' },
+                    ])
+                  ),
                   <Text dimColor>{[`${p.done}/${p.total}`, t.statusLine(p.running, 0, 0), fmtTime(p.updatedAt)].filter(Boolean).join(' · ')}</Text>,
                 ),
               ),
