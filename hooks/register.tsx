@@ -87,6 +87,10 @@ const SELECTED = atom({ plugin: 'workflow-map', key: 'selected' } as const, '')
  * 所以按深淺主題選色（接近 app 自己卡片的顏色）。
  */
 const PEEK_MAX = 6
+/** 清單的闊度上限（格，≈ 420px）；實際 = min(這個, 橫條闊 − 4) */
+const PEEK_W = 56
+/** 桌面一格最多幾 px（比 PX_PER_COL 偏大）：只用來算清單的位置，估錯只會令清單留在橫條內 */
+const PX_PER_COL_MAX = 8
 const PEEK_FILL = { dark: '#2b2b2b', light: '#f3f3f3' } as const
 /** 全圖面板最上面的說明卡是否打開 */
 const HELP_OPEN = atom({ plugin: 'workflow-map', key: 'helpOpen' } as const, false)
@@ -894,39 +898,84 @@ export const register: Register = (on, options) => {
       const head = bandHeader(map, view, lang, T, avail, pending, clock, etaM === undefined ? '' : `≈ ${t.durShort(etaM)}`)
       const graph = expanded ? bandGraph(map, view, lang, T, avail + 56, clock) : undefined
       // 指著兩端小卡時的清單（無 hook：有 key 的 Box 是 hover 範圍，裏面藏一個沒有 key、display:none 的 Box，hover 時 display:flex）。
-      // position:absolute、bottom={1}：向上開（下面是輸入框），底邊貼住小卡頂；已完成的由左邊對齊、稍後的由右邊對齊（在線的盡頭，向左開不出界）
+      // position:absolute、bottom={1}：向上開（下面是輸入框），底邊貼住小卡頂。清單是父 Box 的一部分：指標由小卡移到清單上仍然打開。
+      // 固定闊度；每項兩行：[圖示][標題]／[空位][淡色提示（稍後：等甚麼；已完成：負責人 · 用時）]，兩行都只一行、省略號，不換行；
+      // 項與項之間一格；最多 PEEK_MAX 項，多的在最後一行（上面一條 app 的分隔線）：「… 還有 N 項 · 全圖」，全圖是按鈕。
       const ready = readyIds(map.nodes)
       const byId = new Map(map.nodes.map(n => [n.id, n]))
       const peekFill = PEEK_FILL[(await read($, LIGHT)) ? 'light' : 'dark']
-      const peek = (rows: { n: (typeof map.nodes)[number]; meta: string }[], more: number, side: 'left' | 'right') => (
+      const popW = Math.min(PEEK_W, (e.props.bodyColumns || 100) - 4)
+      const textW = popW - 2 * SPACE.PAD - 2 - 4 // 框、內距、圖示欄（20px ≈ 3 格）與間距
+      const Markdown = 'Markdown' in table ? table.Markdown : undefined
+      const peekLine = (icon: RenderChildren, text: string, dim: boolean) => (
+        <Box flexDirection="row" alignItems="center" gap={SPACE.GAP}>
+          <Box flexShrink={0}>{icon}</Box>
+          <Box flexShrink={1} minWidth={0} overflow="hidden">
+            <Text dimColor={dim} wrap="truncate-end">
+              {fitCells(text, textW) || ' '}
+            </Text>
+          </Box>
+        </Box>
+      )
+      const peek = (
+        rows: { n: (typeof map.nodes)[number]; hint: string }[],
+        more: number,
+        anchor: { left: number } | { right: number },
+        full: { key: string; open: () => Promise<unknown> },
+      ) => (
         <Box
           position="absolute"
           bottom={1}
-          {...(side === 'left' ? { left: 0 } : { right: 0 })}
+          {...anchor}
+          width={popW}
           display="none"
           hover={{ display: 'flex' }}
           flexDirection="column"
-          paddingX={SPACE.PAD}
+          gap={SPACE.GAP}
+          padding={SPACE.PAD}
           borderStyle="round"
           borderColor={CARD_EDGE}
           backgroundColor={peekFill}
         >
-          {rows.map(({ n, meta }) => (
-            <Box flexDirection="row" alignItems="center" gap={SPACE.GAP}>
-              <Svg source={iconPic(kindOf(n, ready, clock), !!n.inserted, T).source} alt={t.status[n.status]} width={ICON_COL} height={ICON_COL} />
-              <Text>{fitCells(n.title, 32)}</Text>
-              {meta ? <Text dimColor>{fitCells(meta, 36)}</Text> : null}
+          {rows.map(({ n, hint }) => (
+            <Box flexDirection="column">
+              {peekLine(<Svg source={iconPic(kindOf(n, ready, clock), !!n.inserted, T).source} alt={t.status[n.status]} width={ICON_COL} height={ICON_COL} />, n.title, false)}
+              {peekLine(<Svg source={slotPic(T).source} alt="" width={ICON_COL} height={ICON_COL} />, hint, true)}
             </Box>
           ))}
-          {more > 0 ? <Text dimColor>{t.peekMore(more)}</Text> : null}
+          {more > 0 ? (Markdown ? <Markdown text="---" /> : null) : null}
+          {more > 0 ? (
+            <Box flexDirection="row" alignItems="center">
+              <Box flexShrink={1} minWidth={0} overflow="hidden">
+                <Text dimColor wrap="truncate-end">{`${t.peekMore(more)} · `}</Text>
+              </Box>
+              <Box flexShrink={0}>
+                <Button key={full.key} {...ICON_BTN} label={t.openTip} onPress={full.open} />
+              </Box>
+            </Box>
+          ) : null}
         </Box>
       )
       const waitsOf = (n: (typeof map.nodes)[number]) => {
         const w = n.deps.map(d => byId.get(d)).filter(d => d && d.status !== 'done' && d.status !== 'dropped')
-        return w.length ? `← ${t.waitShort(w.map(d => d!.title).join(t.list))}` : ''
+        return w.length ? t.waitShort(w.map(d => d!.title).join(t.list)) : ''
       }
-      const laterRows = (graph?.hiddenSteps ?? []).map(n => ({ n, meta: waitsOf(n) }))
-      const doneRows = view.done.map(n => ({ n, meta: metaOf(n, lang, clock) }))
+      const laterRows = (graph?.hiddenSteps ?? []).map(n => ({ n, hint: waitsOf(n) }))
+      const doneRows = view.done.map(n => ({ n, hint: metaOf(n, lang, clock) }))
+      // 稍後清單的位置：幽靈卡右邊到橫條左邊放得下就向左開（右邊對齊幽靈卡），否則左邊貼橫條左邊（不出界）。
+      // 這裏的格寬用偏大的 PX_PER_COL_MAX：估錯只會令清單留在橫條內。
+      const ghostLeftPx = (graph?.done?.width ?? 0) + (graph?.main?.width ?? 0)
+      const laterAnchor =
+        (ghostLeftPx + (graph?.ghost?.width ?? 0)) / PX_PER_COL_MAX >= popW ? { right: 0 } : { left: -Math.floor(ghostLeftPx / PX_PER_COL_MAX) }
+      // 「全圖」：打開全圖並展開對應的一段（稍後／已完成）
+      const openLater = async () => {
+        await update($, FUTURE_OPEN, () => true)
+        await openPane($, lang)
+      }
+      const openDone = async () => {
+        await update($, DONE_OPEN, () => true)
+        await openPane($, lang)
+      }
       const s = stats(map)
       planRows = [
         <Box key="title" flexDirection="row" alignItems="center" gap={SPACE.GAP}>
@@ -951,7 +1000,7 @@ export const register: Register = (on, options) => {
             {graph.done ? (
               <Box key="peek-done" flexShrink={0}>
                 <Svg source={graph.done.source} alt={t.doneCard(view.done.length)} width={graph.done.width} height={graph.done.height} />
-                {peek(doneRows.slice(-PEEK_MAX), Math.max(0, doneRows.length - PEEK_MAX), 'left')}
+                {peek(doneRows.slice(-PEEK_MAX), Math.max(0, doneRows.length - PEEK_MAX), { left: 0 }, { key: 'peek-full-done', open: openDone })}
               </Box>
             ) : null}
             {graph.main ? (
@@ -962,7 +1011,7 @@ export const register: Register = (on, options) => {
             {graph.ghost ? (
               <Box key="peek-later" flexShrink={0}>
                 <Svg source={graph.ghost.source} alt={t.laterCard(graph.hiddenSteps.length)} width={graph.ghost.width} height={graph.ghost.height} />
-                {peek(laterRows.slice(0, PEEK_MAX), Math.max(0, laterRows.length - PEEK_MAX), 'right')}
+                {peek(laterRows.slice(0, PEEK_MAX), Math.max(0, laterRows.length - PEEK_MAX), laterAnchor, { key: 'peek-full-later', open: openLater })}
               </Box>
             ) : null}
           </Box>

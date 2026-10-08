@@ -479,8 +479,8 @@ describe('band', () => {
 
     await ui.press({ key: 'toggle' })
     const all = await ui.findAll({ type: 'Svg' })
-    // 標題行兩張 + 卡片圖：已完成小卡（+ 指著時清單的圖示）、各層的卡；沒有收起的步驟 → 沒有幽靈卡
-    expect(all.length).toBe(5)
+    // 標題行兩張 + 卡片圖：已完成小卡（+ 指著時清單：圖示與第二行的空位）、各層的卡；沒有收起的步驟 → 沒有幽靈卡
+    expect(all.length).toBe(6)
     expect(await ui.find({ key: 'peek-later' })).toBeUndefined()
     const graph = all.slice(2).map(s => String(s.props.source)).join('')
     // 已完成一張卡 + 「寫 API ∥ 畫 UI」同一張卡；整合測試屬較遠的一層（小計劃不收，畫第三張）
@@ -1652,5 +1652,79 @@ describe('pane rows never wrap', () => {
     expect(metaOf({ ...n, owner: 'Grok' }, 'ko', at(94))).toBe('Grok · 1h34m')
     expect(metaOf({ ...n, owner: 'Grok' }, 'zh-Hant', at(25))).toBe('Grok · 25分')
     expect(metaOf({ ...n, owner: 'Grok' }, 'en', at(25))).toBe('Grok · 25m')
+  })
+})
+
+describe('band popovers (hover lists)', () => {
+  type El = { type?: string; key?: string; props: Record<string, unknown>; hover?: Record<string, unknown>; children?: (El | string | null)[] }
+  const kids = (e: El | undefined) => (e?.children ?? []).filter((c): c is El => !!c && typeof c === 'object')
+  const all = (e: El | undefined): El[] => (e ? [e, ...kids(e).flatMap(all)] : [])
+  const txt = (e: El | string | null | undefined): string => (typeof e === 'string' ? e : !e ? '' : (e.children ?? []).map(txt).join(''))
+  const pop = (box: El | undefined) => kids(box).find(c => c.type === 'Box' && c.props.display === 'none')
+  // 8 步已完成、1 步進行中、之後 12 步一條直線（長中文名稱、等前一步）
+  const nodes = [
+    ...Array.from({ length: 8 }, (_, i) => ({ id: `d${i}`, title: `已完成的第${i + 1}步：整理資料結構並寫入計劃檔`, status: 'done', owner: '介面設計師', deps: i ? [`d${i - 1}`] : [] })),
+    { id: 'a', title: '驗證合併：控制器、熱通量、推力與姿態資料', status: 'doing', owner: 'Grok', deps: ['d7'] },
+    ...Array.from({ length: 12 }, (_, i) => ({ id: `l${i}`, title: `飛行介面圖示化與 SAS 模式第${i + 1}部分`, status: 'todo', deps: [i ? `l${i - 1}` : 'a'] })),
+  ]
+  const setup = async ($: Engine, on: On) => {
+    const opened: string[] = []
+    world(on, {})
+    on('ui.open', ($, e) => {
+      opened.push(String((e as { id?: string }).id))
+      return { value: { isPlaced: true as const } }
+    })
+    await $.session.start(START)
+    await $.tool.call({ tool: TOOL, op: 'set_plan', nodes } as never)
+    const ui = await $.ui.mount({ plugin: 'workflow-map', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+    await ui.press({ key: 'toggle' })
+    return { ui, opened }
+  }
+
+  test('fixed width; every item is icon + title on one line and a dim hint on one line; nothing wraps; same shape for every item', async ($, on) => {
+    const { ui } = await setup($, on)
+    for (const key of ['peek-later', 'peek-done']) {
+      const p = pop((await ui.find({ key })) as unknown as El)
+      expect([key, p?.props.width]).toEqual([key, 56]) // min(56, 140 − 4)
+      expect(p?.hover?.display).toBe('flex')
+      const items = kids(p).filter(c => c.type === 'Box' && c.props.flexDirection === 'column')
+      expect(items.length).toBe(6)
+      for (const it of items) {
+        const [l1, l2] = kids(it)
+        for (const [l, dim] of [
+          [l1, false],
+          [l2, true],
+        ] as const) {
+          // [圖示欄（不縮）][文字（可縮、省略號）]
+          expect(kids(l).map(c => c.props.flexShrink)).toEqual([0, 1])
+          const t = all(l).filter(e => e.type === 'Text')
+          expect(t.map(e => [e.props.wrap, e.props.dimColor])).toEqual([['truncate-end', dim]])
+        }
+      }
+      // 第一項：標題、提示
+      const first = items[0]!
+      const [title, hint] = kids(first).map(l => txt(all(l).find(e => e.type === 'Text')))
+      if (key === 'peek-later') expect([title, hint]).toEqual(['飛行介面圖示化與 SAS 模式第2部分', '待 飛行介面圖示化與 SAS 模式第1部分'])
+      else expect(hint).toBe('介面設計師')
+    }
+    await ui.unmount()
+  })
+
+  test('more than 6: a hairline, then "… 還有 N 項 · 全圖" where 全圖 is a button that opens the pane with that section unfolded', async ($, on) => {
+    const { ui, opened } = await setup($, on)
+    const later = pop((await ui.find({ key: 'peek-later' })) as unknown as El)
+    expect(all(later).some(e => e.type === 'Markdown' && e.props.text === '---')).toBe(true)
+    expect(all(later).some(e => e.type === 'Text' && /^… 還有 \d+ 項 · $/.test(txt(e)))).toBe(true)
+    expect(all(later).find(e => e.type === 'Button')?.props.label).toBe('全圖')
+    await ui.press({ key: 'peek-full-later' })
+    await ui.press({ key: 'peek-full-done' })
+    expect(opened).toEqual(['workflow-map', 'workflow-map'])
+    await ui.unmount()
+    const pane = await $.ui.mount({ plugin: 'workflow-map', surface: 'desktop', component: 'Pane', requestId: 'workflow-map', props: { title: 'x', isFocused: false, bodyColumns: 100 } as never })
+    // 稍後一段展開（稍後的卡畫出來）、已完成一段展開（已完成的卡）
+    const keys = (await pane.findAll({ type: 'Box' })).map(b => String(b.key ?? b.props.key ?? ''))
+    expect(keys.filter(k => k.startsWith('stage:')).length).toBeGreaterThan(3)
+    expect(keys).toContain('done')
+    await pane.unmount()
   })
 })

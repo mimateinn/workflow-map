@@ -168,7 +168,7 @@ export type Strings = {
   nothingToUndo: string
   /** 說明卡第一行的「語言」 */
   languageLabel: string
-  /** 彈出清單最後一行：還有幾項（全圖看） */
+  /** 彈出清單最後一行：還有幾項（後面接「全圖」按鈕） */
   peekMore: (n: number) => string
   /** 由模型的待辦清單自動建立計劃時的通知；沒有計劃但做了不少工作時的一行提示 */
   autoPlanMade: string
@@ -311,7 +311,7 @@ const ZH_HANT: Strings = {
   left: '已離開計劃',
   planNotFound: r => `找不到計劃：${r}`,
   languageLabel: '語言',
-  peekMore: n => `… 還有 ${n} 項 · 全圖`,
+  peekMore: n => `… 還有 ${n} 項`,
   autoPlanMade: '已根據待辦清單建立工作流程',
   nudge: '可用 /workflow 開始計劃',
   continueLead: '繼續做：',
@@ -432,7 +432,7 @@ const EN: Strings = {
   left: 'Left the plan',
   planNotFound: r => `No plan found: ${r}`,
   languageLabel: 'Language',
-  peekMore: n => `… +${n} more · Full view`,
+  peekMore: n => `… ${n} more`,
   autoPlanMade: 'Workflow created from the to-do list',
   nudge: 'Use /workflow to start a plan',
   continueLead: 'Continue: ',
@@ -554,7 +554,7 @@ const JA: Strings = {
   left: '計画から離れました',
   planNotFound: r => `計画が見つかりません：${r}`,
   languageLabel: '言語',
-  peekMore: n => `… 他 ${n} 件 · 全体`,
+  peekMore: n => `… 他 ${n} 件`,
   autoPlanMade: 'ToDo リストからワークフローを作成しました',
   nudge: '/workflow で計画を始められます',
   continueLead: '続けて：',
@@ -672,7 +672,7 @@ const KO: Strings = {
   left: '계획에서 나갔습니다',
   planNotFound: r => `계획을 찾을 수 없습니다: ${r}`,
   languageLabel: '언어',
-  peekMore: n => `… ${n}개 더 · 전체`,
+  peekMore: n => `… ${n}개 더`,
   autoPlanMade: '할 일 목록으로 워크플로를 만들었습니다',
   nudge: '/workflow 로 계획을 시작할 수 있습니다',
   continueLead: '계속: ',
@@ -788,7 +788,7 @@ const ES: Strings = {
   left: 'Saliste del plan',
   planNotFound: r => `No se encontró el plan: ${r}`,
   languageLabel: 'Idioma',
-  peekMore: n => `… ${n} más · Vista completa`,
+  peekMore: n => `… ${n} más`,
   autoPlanMade: 'Flujo de trabajo creado a partir de la lista de tareas',
   nudge: 'Usa /workflow para empezar un plan',
   continueLead: 'Continúa: ',
@@ -904,7 +904,7 @@ const FR: Strings = {
   left: 'Plan quitté',
   planNotFound: r => `Plan introuvable : ${r}`,
   languageLabel: 'Langue',
-  peekMore: n => `… ${n} de plus · Vue complète`,
+  peekMore: n => `… ${n} de plus`,
   autoPlanMade: 'Flux de travail créé à partir de la liste de tâches',
   nudge: 'Utilisez /workflow pour commencer un plan',
   continueLead: 'Continue : ',
@@ -1021,7 +1021,7 @@ const DE: Strings = {
   left: 'Plan verlassen',
   planNotFound: r => `Kein Plan gefunden: ${r}`,
   languageLabel: 'Sprache',
-  peekMore: n => `… ${n} weitere · Gesamtansicht`,
+  peekMore: n => `… ${n} weitere`,
   autoPlanMade: 'Workflow aus der To-do-Liste erstellt',
   nudge: 'Mit /workflow einen Plan beginnen',
   continueLead: 'Weiter: ',
