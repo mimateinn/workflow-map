@@ -1,7 +1,7 @@
 {
   "name": "workflow-map",
-  "version": "0.1.0",
-  "description": "Live workflow map: a one-line progress strip above the prompt that expands into a compact metro-line view of the current work (parallel branches, dependencies, status), with your mid-plan interjections clearly marked.",
+  "version": "0.2.0",
+  "description": "Live workflow map: one row above the prompt (what is running, what is next, segmented progress) that expands into a card graph of parallel steps, plus a full stage-by-stage view, with your mid-plan interjections clearly marked.",
   "author": {
     "name": "mimateinn"
   },
@@ -11,11 +11,12 @@
     "language": {
       "type": "string",
       "title": "Language",
-      "description": "Interface language. auto = Traditional Chinese when step titles contain CJK characters, otherwise English.",
+      "description": "Interface language. auto = the language of your most recent prompt (Traditional Chinese, Simplified Chinese or English); English when unsure.",
       "default": "auto",
       "options": [
         "auto",
         "zh-Hant",
+        "zh-Hans",
         "en"
       ]
     }

@@ -1,440 +1,426 @@
-// 膠囊畫法：步驟是線上的膠囊（字在膠囊內）；收起 = 一行膠囊；展開 = 地鐵線 + 膠囊站。
-// 透明底。types 沒有主題 API（Svg 以圖片繪製，讀不到 app 主題），所以膠囊一律用「不透明的中深色底 + 淺色字」：
-// 字與膠囊底的對比 ≥ 4.5:1，與背後是深色還是淺色主題無關。線用中間調，兩種背景都看得見。
-// 介面記號全部是圖形（✓、插入圓點），不用任何語言的文字當記號。
+// 畫法：每個介面一張 SVG（圖片模式、透明底、不用 isInteractive）。
+// 收起 = 一行「進行中 + 分段進度條 + 6/11」；展開 = GitHub Actions 式卡片（同一層的並行步驟疊在同一張卡）；
+// 全圖 = GitLab 式階段卡，由上而下。數字一律是 SVG 內的文字，不是按鈕。
+// Svg 以圖片繪製讀不到 app 主題：色板分深／淺兩套，由 register 按 /config 的 theme 選。
 import type { WorkflowMap, WorkflowNode } from '../types/index'
 import { allDone, columns, readyIds, stats } from './graph'
+import type { StageView } from './graph'
 import { STR } from './i18n'
 import type { Lang } from './i18n'
 
-/** 色板（README 技術說明有同一份，供其他 mod 抄用）。字色對膠囊底的對比都 ≥ 4.5:1。 */
-export const PALETTE = {
-  accent: '#d97757', // 線（已走過）、光暈
-  done: { fill: '#5c4037', text: '#fbe4da' },
-  doing: { fill: '#b5532f', text: '#ffffff' },
-  todo: { fill: '#3f3f46', text: '#f4f4f5' },
-  ready: { fill: '#3f3f46', text: '#ffffff', stroke: '#d97757' },
-  blocked: { fill: '#a3282c', text: '#ffffff' },
-  dropped: { fill: '#52525b', text: '#d4d4d8' },
-  ins: { fill: '#5b3fa8', text: '#ffffff', mark: '#8b5cf6' },
-  warn: { fill: '#8a5a00', text: '#ffffff', dot: '#f5a524' },
-  track: 'rgba(128,128,128,.35)',
-  lineTodo: 'rgba(128,128,128,.55)',
-} as const
+export type Theme = {
+  /** 淡色面（卡底、線、未開始）的基色：深色主題用白、淺色主題用黑，再配透明度 */
+  ink: string
+  text: string
+  dim: string
+  done: string
+  run: string
+  block: string
+  ins: string
+}
 
-const P = PALETTE
-const CSS =
+/** 淺色版 = 深色版每個色板通道 × 0.55（約暗 45%） */
+const darken = (hex: string) =>
+  `#${[1, 3, 5].map(i => Math.round(parseInt(hex.slice(i, i + 2), 16) * 0.55).toString(16).padStart(2, '0')).join('')}`
+const DARK: Theme = { ink: '#ffffff', text: '#e6e6e3', dim: '#a3a3a0', done: '#3fa66b', run: '#d97757', block: '#d9962b', ins: '#a78bfa' }
+export const THEMES: Record<'dark' | 'light', Theme> = {
+  dark: DARK,
+  light: { ink: '#000000', text: '#1f1f1f', dim: '#5e5e5b', done: darken(DARK.done), run: darken(DARK.run), block: darken(DARK.block), ins: darken(DARK.ins) },
+}
+
+/** 桌面版一格約多少 px（types 沒有提供；寧小勿大：放得下好過跑出邊界） */
+export const PX_PER_COL = 6.4
+/** 全圖面板：真機 6.4 只用到約七成闊度，改用 7.5（仍偏小） */
+export const PANE_PX_PER_COL = 7.5
+
+const FONT = "system-ui,-apple-system,'Segoe UI','Microsoft JhengHei','PingFang TC','Noto Sans CJK TC',sans-serif"
+const css = (T: Theme) =>
   '<style>' +
-  'rect{stroke-width:1}' +
-  `.f-done{fill:${P.done.fill};stroke:none}.t-done{fill:${P.done.text}}` +
-  `.f-doing{fill:${P.doing.fill};stroke:${P.doing.fill}}.t-doing{fill:${P.doing.text};font-weight:600}` +
-  `.r-doing{fill:none;stroke:${P.accent}}` +
-  `.f-todo{fill:${P.todo.fill};stroke:none}.t-todo{fill:${P.todo.text}}` +
-  `.f-ready{fill:${P.ready.fill};stroke:${P.ready.stroke};stroke-width:1.5}.t-ready{fill:${P.ready.text}}` +
-  `.f-blocked{fill:${P.blocked.fill};stroke:none}.t-blocked{fill:${P.blocked.text}}` +
-  `.f-dropped{fill:${P.dropped.fill};stroke:none}.t-dropped{fill:${P.dropped.text};text-decoration:line-through}` +
-  `.f-ins{fill:${P.ins.fill};stroke:none}.t-ins{fill:${P.ins.text}}` +
-  `.f-warn{fill:${P.warn.fill};stroke:none}.t-warn{fill:${P.warn.text}}` +
-  `.f-prog{fill:${P.doing.fill}}.f-progbg{fill:${P.todo.fill}}.t-prog{fill:#ffffff;font-weight:600}` +
-  `.f-track{fill:${P.track}}.ln-done{stroke:${P.accent}}.ln-todo{stroke:${P.lineTodo}}` +
-  // 圖示（✓、→、!）用線條畫，顏色同該膠囊的字
-  (['done', 'doing', 'todo', 'ready', 'blocked', 'dropped', 'ins', 'warn'] as const).map(k => `.s-${k}{stroke:${P[k].text};fill:none}`).join('') +
-  '.s-prog{stroke:#ffffff;fill:none}' +
+  `text{font-family:${FONT};font-size:12px;fill:${T.text};font-variant-numeric:tabular-nums}` +
+  `.m{font-size:11px;fill:${T.dim}}.d{fill:${T.dim}}.b{font-weight:600}.r{fill:${T.run}}.a{fill:${T.block}}` +
+  // 進行中：圓環向外擴散、淡出（CSS 動畫；圖片模式的 SVG 亦會播放）
+  '@keyframes wmp{0%{opacity:.8;transform:scale(1)}70%,100%{opacity:0;transform:scale(1.8)}}' +
+  '.p{transform-box:fill-box;transform-origin:center;animation:wmp 1.8s ease-out infinite}' +
+  '@media (prefers-reduced-motion:reduce){.p{animation:none;opacity:0}}' +
   '</style>'
-const FONT = `font-family="system-ui, 'Segoe UI', 'Microsoft JhengHei', 'PingFang TC', 'Noto Sans TC', sans-serif"`
+
+export type Pic = { source: string; width: number; height: number }
+const doc = (w: number, h: number, T: Theme, body: string): Pic => {
+  const width = Math.max(1, Math.ceil(w))
+  const height = Math.max(1, Math.ceil(h))
+  return { source: `<svg xmlns='http://www.w3.org/2000/svg' width='${width}' height='${height}' viewBox='0 0 ${width} ${height}'>${css(T)}${body}</svg>`, width, height }
+}
 
 const esc = (s: string) => s.replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`)
-const isWide = (ch: string) => /[⺀-￿]/.test(ch)
+const r1 = (n: number) => Math.round(n * 10) / 10
+const WIDE = /[⺀-鿿가-힯豈-﫿︰-﹏＀-｠￠-￦]/
 
-/** 按顯示闊度截字：CJK 算 2，其他算 1。 */
-export function clip(s: string, units: number): string {
-  let w = 0
-  let out = ''
+/** 估算文字闊度（px）：CJK = 1em；拉丁字按字形粗分（系統無襯線字體）。 */
+export function tw(s: string, size = 12): number {
+  let em = 0
   for (const ch of s) {
-    w += isWide(ch) ? 2 : 1
-    if (w > units) return `${out}…`
-    out += ch
+    if (WIDE.test(ch)) em += 1
+    else if ("il.,:;|!'·".includes(ch)) em += 0.28
+    else if ('fjrt -/()[]'.includes(ch)) em += 0.36
+    else if ('mwMW'.includes(ch)) em += 0.86
+    else if (ch >= 'A' && ch <= 'Z') em += 0.66
+    else em += 0.56
   }
-  return out
+  return Math.ceil(em * size)
 }
 
-/** 估算文字闊度（px）：CJK ≈ 1em，其他 ≈ 0.6em。 */
-const textW = (s: string, font: number) => [...s].reduce((w, ch) => w + (isWide(ch) ? font : font * 0.6), 0)
-
-export type Kind = 'done' | 'doing' | 'todo' | 'ready' | 'blocked' | 'dropped' | 'ins' | 'warn' | 'prog'
-/** progress：0–1，膠囊內由左至右填色（進度條膠囊）；check／next／alert／ins：前面畫對應圖示（全部用 SVG 線條畫，不用文字符號） */
-export type Cap = { text: string; kind: Kind; title: string; check?: boolean; ins?: boolean; next?: boolean; alert?: boolean; progress?: number; dot?: boolean }
-type Geo = { h: number; font: number }
-
-const markW = (g: Geo) => g.font * 1.15
-const iconW = (g: Geo) => g.font * 1.05
-const capW = (c: Cap, g: Geo) =>
-  Math.round(g.h * 0.9 + textW(c.text, g.font) + [c.check, c.next, c.alert].filter(Boolean).length * iconW(g) + (c.ins ? markW(g) : 0))
-
-/** 「有新要求未記入」的琥珀色小圓點，慢慢呼吸；與語言無關。 */
-function amberDot(cx: number, cy: number, r: number): string {
-  return (
-    `<circle cx="${cx}" cy="${cy}" r="${r + 2.5}" fill="${P.warn.dot}" opacity="0.35">` +
-    '<animate attributeName="opacity" values="0.45;0;0.45" dur="1.8s" repeatCount="indefinite"/></circle>' +
-    `<circle cx="${cx}" cy="${cy}" r="${r}" fill="${P.warn.dot}" stroke="rgba(0,0,0,.35)" stroke-width="1"/>`
-  )
+/** 截到 maxPx 以內，超出加「…」。 */
+export function fit(s: string, size: number, maxPx: number): string {
+  if (tw(s, size) <= maxPx) return s
+  const chars = [...s]
+  while (chars.length && tw(`${chars.join('')}…`, size) > maxPx) chars.pop()
+  return chars.length ? `${chars.join('').trimEnd()}…` : ''
 }
-
-/** 獨立的琥珀色小圓點（展開時放在右邊按鈕旁、全圖面板標題旁）。 */
-export function pendingDot(): SvgResult {
-  return { source: svgDoc(14, 14, amberDot(7, 7, 3.5)), width: 14, height: 14, hidden: 0 }
-}
-
-/** 插入記號：紫色圓點內一個「+」（與語言無關）。 */
-function insMark(cx: number, cy: number, r: number): string {
-  const a = r * 0.55
-  return (
-    `<circle cx="${cx}" cy="${cy}" r="${r}" fill="${P.ins.mark}" stroke="#ffffff" stroke-width="1"/>` +
-    `<path d="M${cx - a},${cy} H${cx + a} M${cx},${cy - a} V${cy + a}" stroke="#ffffff" stroke-width="1.4" stroke-linecap="round"/>`
-  )
-}
-
-/** 線條圖示，左邊 x、垂直中心 cy、大小 sz（≈ 字高）。 */
-function icon(kind: 'check' | 'next' | 'alert', cls: string, x: number, cy: number, sz: number): string {
-  const a = `class="${cls}" stroke-width="${(sz * 0.17).toFixed(2)}" stroke-linecap="round" stroke-linejoin="round"`
-  const f = (n: number) => n.toFixed(1)
-  if (kind === 'check') return `<path ${a} d="M${f(x)},${f(cy)} L${f(x + sz * 0.36)},${f(cy + sz * 0.34)} L${f(x + sz)},${f(cy - sz * 0.36)}"/>`
-  if (kind === 'next')
-    return `<path ${a} d="M${f(x)},${f(cy)} H${f(x + sz)} M${f(x + sz * 0.56)},${f(cy - sz * 0.42)} L${f(x + sz)},${f(cy)} L${f(x + sz * 0.56)},${f(cy + sz * 0.42)}"/>`
-  return `<path ${a} d="M${f(x + sz * 0.5)},${f(cy - sz * 0.48)} V${f(cy + sz * 0.12)} M${f(x + sz * 0.5)},${f(cy + sz * 0.44)} V${f(cy + sz * 0.45)}"/>`
-}
-
-/** 一粒膠囊：左上角 (x, y)，高 g.h，半徑 = 高 / 2；全名放在 <title>。 */
-function capsule(c: Cap, x: number, y: number, g: Geo): string {
-  const w = capW(c, g)
-  const r = g.h / 2
-  const base = y + r + g.font * 0.36
-  let tx = x + g.h * 0.45
-  const box = `x="${x + 0.5}" y="${y + 0.5}" width="${w - 1}" height="${g.h - 1}" rx="${r - 0.5}"`
-  const out = [`<g><title>${esc(c.title)}</title>`]
-  if (c.kind === 'doing') {
-    // 「現在在這裏」：外圈慢慢呼吸的光暈（SMIL；不支援動畫時仍是一圈框）
-    out.push(
-      `<rect class="r-doing" x="${x - 2}" y="${y - 2}" width="${w + 4}" height="${g.h + 4}" rx="${r + 2}" stroke-width="2" opacity="0.5">` +
-        '<animate attributeName="opacity" values="0.6;0.1;0.6" dur="2.2s" repeatCount="indefinite"/></rect>',
-    )
-  }
-  if (c.progress !== undefined) {
-    const id = `pc${Math.round(x)}_${Math.round(y)}`
-    out.push(`<clipPath id="${id}"><rect ${box}/></clipPath>`)
-    out.push(`<rect class="f-progbg" ${box}/>`)
-    out.push(`<rect class="f-prog" x="${x}" y="${y}" width="${(w * Math.min(1, Math.max(0, c.progress))).toFixed(1)}" height="${g.h}" clip-path="url(#${id})"/>`)
-  } else {
-    out.push(`<rect class="f-${c.kind}" ${box}/>`)
-  }
-  const sz = g.font * 0.72
-  for (const k of ['check', 'next', 'alert'] as const) {
-    if (!c[k]) continue
-    out.push(icon(k, `s-${c.kind}`, tx, y + r, sz))
-    tx += iconW(g)
-  }
-  if (c.ins) {
-    const mr = g.font * 0.42
-    out.push(insMark(tx + mr, y + r, mr))
-    tx += markW(g)
-  }
-  out.push(`<text class="t-${c.kind}" x="${tx}" y="${base}" font-size="${g.font}">${esc(c.text)}</text>`)
-  if (c.dot) out.push(amberDot(x + w - 3, y + 3, 3.5))
-  out.push('</g>')
-  return out.join('')
-}
-
-/** 步驟 → 膠囊。插入的步驟用紫色（進行中／已完成則保留其狀態色，只加插入記號）。 */
-export function nodeCap(n: WorkflowNode, isReady: boolean, lang: Lang, units = 16): Cap {
-  const t = STR[lang]
-  const kind: Kind =
-    n.inserted && n.status !== 'doing' && n.status !== 'done' ? 'ins' : n.status === 'todo' && isReady ? 'ready' : n.status
-  const title = [`${n.title} — ${isReady ? t.ready : t.status[n.status]}`, n.inserted ? t.inserted(n.inserted.note) : '', n.note ?? '']
-    .filter(Boolean)
-    .join('\n')
-  return { text: clip(n.title, units), kind, title, check: n.status === 'done', ins: !!n.inserted }
-}
-
-const svgDoc = (w: number, h: number, body: string) =>
-  `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" ${FONT}>${CSS}${body}</svg>`
-
-export type SvgResult = { source: string; width: number; height: number; hidden: number }
-
-/** 一行膠囊；放不下的不畫，數目回傳為 hidden（由介面畫一個可按的「+N」按鈕開全圖）。 */
-export function capsRow(caps: Cap[], maxWidth: number, g: Geo = { h: 20, font: 11.5 }): SvgResult {
-  const gap = 16
-  const parts: string[] = []
-  let x = 2 // 留 2px 給進行中膠囊的光暈
-  let shown = 0
-  for (const c of caps) {
-    if (x + capW(c, g) > maxWidth - 2) break
-    parts.push(capsule(c, x, 2, g))
-    x += capW(c, g) + gap
-    shown++
-  }
-  const width = Math.max(1, Math.round(x - gap + 2))
-  return { source: svgDoc(width, g.h + 4, parts.join('')), width, height: g.h + 4, hidden: caps.length - shown }
-}
-
-// ---------------- 收起：一行膠囊 ----------------
-
-/** [進度 5/10，膠囊內填色] → 每個進行中 → [→ 下一步] → [插入記號 N]（→ [未記錄]） */
-export function summaryCaps(map: WorkflowMap, pending: boolean, lang: Lang): Cap[] {
-  const t = STR[lang]
-  const s = stats(map)
-  const ready = readyIds(map.nodes)
-  if (allDone(map)) return [{ text: `${s.done}/${s.total}`, kind: 'done', check: true, title: t.allDone }]
-  const caps: Cap[] = [
-    {
-      text: `${s.done}/${s.total}`,
-      kind: 'prog',
-      progress: s.total ? s.done / s.total : 0,
-      title: pending ? `${t.progressTip(s.done, s.total)}\n${t.unloggedTip}` : t.progressTip(s.done, s.total),
-      dot: pending,
-    },
-  ]
-  for (const n of map.nodes.filter(n => n.status === 'doing')) caps.push(nodeCap(n, false, lang, 14))
-  for (const n of map.nodes.filter(n => n.status === 'blocked')) caps.push(nodeCap(n, false, lang, 14))
-  const next = columns(map.nodes).flat().find(n => ready.has(n.id))
-  if (next) caps.push({ ...nodeCap(next, true, lang, 12), kind: 'ready', next: true, ins: false })
-  if (s.inserted) {
-    const tip = map.nodes.filter(n => n.inserted).map(n => t.inserted(n.inserted!.note)).join('\n')
-    caps.push({ text: String(s.inserted), kind: 'ins', ins: true, title: tip })
-  }
-  return caps
-}
-
-/** 終端機版：[✓3/10] [▶改介面] → [發佈] · [+2] */
-export function summaryText(map: WorkflowMap, pending: boolean, lang: Lang): string {
-  return summaryCaps(map, pending, lang)
-    .map(c => {
-      if (c.kind === 'doing') return `[▶${c.text}]`
-      if (c.next) return `→ [${c.text}]`
-      if (c.kind === 'ins') return `· [+${c.text}]`
-      if (c.alert) return `[! ${c.text}]`
-      return `[${c.check || c.kind === 'prog' ? '✓' : ''}${c.text}]`
-    })
-    .join(' ')
-}
-
-// ---------------- 展開：地鐵線 + 膠囊 ----------------
 
 /**
- * 分線：步驟盡量沿依賴那條線延續；分叉開新線；某條線的末端已無待畫的後續、且空出一欄以上，才可再用。
- * 無依賴但有後續的步驟（例如中途插入的獨立工作）放在後續的前一欄，避免一條長線橫跨全圖。
+ * 文字。fixed = 估算闊度，用 textLength（只調字距）鎖死，後面接的東西位置就準；
+ * 右對齊用 text-anchor，不需估算。
  */
-export function lanes(map: WorkflowMap): Map<string, { col: number; lane: number }> {
-  const depthCols = columns(map.nodes)
-  const col = new Map<string, number>()
-  depthCols.forEach((c, i) => c.forEach(n => col.set(n.id, i)))
-  const succ = new Map<string, string[]>()
-  for (const n of map.nodes) for (const d of n.deps) if (col.has(d)) succ.set(d, [...(succ.get(d) ?? []), n.id])
-  for (const n of map.nodes) {
-    const next = succ.get(n.id)
-    if (n.deps.length === 0 && next) col.set(n.id, Math.max(0, Math.min(...next.map(s => col.get(s) ?? 0)) - 1))
-  }
-  const order = map.nodes.map((n, i) => ({ n, i })).sort((a, b) => col.get(a.n.id)! - col.get(b.n.id)! || a.i - b.i)
-
-  const out = new Map<string, { col: number; lane: number }>()
-  const tails: { id: string; col: number }[] = []
-  const open = (id: string) => (succ.get(id) ?? []).some(s => !out.has(s))
-  for (const { n } of order) {
-    const ci = col.get(n.id)!
-    let pick = -1
-    for (const d of n.deps) {
-      const l = out.get(d)?.lane
-      if (l !== undefined && tails[l]?.id === d && (pick < 0 || l < pick)) pick = l
-    }
-    if (pick < 0) pick = tails.findIndex(t => t.col < ci - 1 && !open(t.id))
-    if (pick < 0) pick = tails.length
-    out.set(n.id, { col: ci, lane: pick })
-    tails[pick] = { id: n.id, col: ci }
-  }
-  return out
+function text(x: number, y: number, s: string, cls = '', o: { size?: number; fixed?: boolean; end?: boolean } = {}): string {
+  if (!s) return ''
+  const len = o.fixed ? ` textLength='${tw(s, o.size ?? (cls.includes('m') ? 11 : 12))}' lengthAdjust='spacing'` : ''
+  return `<text x='${r1(x)}' y='${r1(y)}'${cls ? ` class='${cls}'` : ''}${o.end ? " text-anchor='end'" : ''}${len}>${esc(s)}</text>`
 }
 
-export type MetroOptions = {
-  /** 最多顯示幾條線 */
-  lanes: number
-  /** 圖的最大闊度（px）；放不下的欄不畫，數目回傳為 hidden */
-  maxWidth: number
-  /** true = 輸入框上方的精簡版（膠囊高 20、線距 28）；false = 全圖面板 */
-  compact: boolean
-  lang: Lang
-  /** true = 放不下的欄換到下一段（全圖面板用，保證畫出全部步驟）；false = 收起為 hidden */
-  wrap?: boolean
-}
+export type Kind = 'done' | 'doing' | 'ready' | 'todo' | 'blocked'
+export const kindOf = (n: WorkflowNode, ready: Set<string>): Kind =>
+  n.status === 'todo' || n.status === 'dropped' ? (ready.has(n.id) ? 'ready' : 'todo') : n.status
 
-export function metroSvg(map: WorkflowMap, o: MetroOptions): SvgResult {
-  const g = o.compact ? { h: 20, font: 11.5, pitch: 28, gap: 30, pad: 4, units: 16, s: 9 } : { h: 26, font: 13, pitch: 34, gap: 36, pad: 4, units: 60, s: 12 }
-  const geo = { h: g.h, font: g.font }
-  const ready = readyIds(map.nodes)
-  const live = map.nodes.filter(n => !(o.compact && n.status === 'dropped'))
-  const pos = lanes({ ...map, nodes: live })
-  const byIdLive = new Map(live.map(n => [n.id, n]))
-
-  // 線太多時：保留主線（第 0 條）和有「進行中」步驟的線
-  const laneOf = (id: string) => pos.get(id)?.lane ?? 0
-  const hasDoing = (l: number) => live.some(n => laneOf(n.id) === l && n.status === 'doing')
-  const used = [...new Set([...pos.values()].map(p => p.lane))].sort((a, b) => a - b)
-  const shownLanes = used
-    .slice()
-    .sort((a, b) => Number(b === 0) - Number(a === 0) || Number(hasDoing(b)) - Number(hasDoing(a)) || a - b)
-    .slice(0, o.lanes)
-    .sort((a, b) => a - b)
-  const row = new Map(shownLanes.map((l, i) => [l, i]))
-
-  // 每欄闊度 = 該欄最闊的膠囊 + 欄距，平行線上的膠囊不會撞
-  const caps = new Map(live.map(n => [n.id, nodeCap(n, ready.has(n.id), o.lang, g.units)]))
-  const colW: number[] = []
-  for (const n of live) {
-    const p = pos.get(n.id)!
-    if (row.has(p.lane)) colW[p.col] = Math.max(colW[p.col] ?? 0, capW(caps.get(n.id)!, geo))
+/**
+ * 狀態圖示（12px，中心 cx, cy）：✓ 實心圓、進行中 擴散圓環、未開始 空心圓、受阻 琥珀「!」。
+ * 用戶插入的步驟改用菱形（形狀不同，不只靠顏色）。
+ */
+export function icon(k: Kind, ins: boolean, cx: number, cy: number, T: Theme): string {
+  const f = (n: number) => r1(n)
+  const check = `<path d='M${f(cx - 2.7)},${f(cy + 0.2)} L${f(cx - 0.8)},${f(cy + 2.1)} L${f(cx + 2.8)},${f(cy - 2)}' stroke='#ffffff' stroke-width='1.6' fill='none' stroke-linecap='round' stroke-linejoin='round'/>`
+  const bang = (c: string) => `<path d='M${f(cx)},${f(cy - 3)} V${f(cy + 0.7)} M${f(cx)},${f(cy + 2.9)} V${f(cy + 3)}' stroke='${c}' stroke-width='1.7' stroke-linecap='round'/>`
+  if (ins) {
+    const d = (r: number) => `M${f(cx)},${f(cy - r)} L${f(cx + r)},${f(cy)} L${f(cx)},${f(cy + r)} L${f(cx - r)},${f(cy)} Z`
+    if (k === 'done') return `<path d='${d(6.4)}' fill='${T.ins}' stroke-linejoin='round'/>${check}`
+    if (k === 'doing')
+      return (
+        `<path class='p' d='${d(6.2)}' fill='none' stroke='${T.run}' stroke-width='1.5' stroke-linejoin='round'/>` +
+        `<path d='${d(6.2)}' fill='none' stroke='${T.run}' stroke-width='1.5' stroke-linejoin='round'/><path d='${d(3.2)}' fill='${T.ins}'/>`
+      )
+    return `<path d='${d(5.6)}' fill='none' stroke='${T.ins}' stroke-width='1.5' stroke-linejoin='round'/>${k === 'blocked' ? bang(T.block) : ''}`
   }
-  // 欄位置；wrap 時放不下的欄換到下一段（像文字換行）。續段左邊縮入，畫一個「↳」表示接上一段。
-  const INDENT = 20
-  const colX: number[] = []
-  const colSeg: number[] = []
-  let x = 3 // 留位給進行中膠囊的光暈
-  let seg = 0
-  let lastCol = -1
-  for (let c = 0; c < colW.length; c++) {
-    const w = colW[c] ?? 0
-    if (x + w > o.maxWidth - 3) {
-      if (!o.wrap) break
-      if (x > (seg ? 3 + INDENT : 3)) {
-        seg++
-        x = 3 + INDENT
-      }
-    }
-    colX[c] = x
-    colSeg[c] = seg
-    lastCol = c
-    x += w + g.gap
-  }
-
-  // 每段的行：第一段照線的次序壓緊；續段按「線的次序」排在最上面，且子步驟不會高過同段內的父步驟。
-  const rowOf = new Map<string, number>()
-  const segRowsUsed: number[] = []
-  const inSeg = (n: WorkflowNode) => {
-    const p = pos.get(n.id)!
-    return row.has(p.lane) && p.col <= lastCol ? colSeg[p.col]! : -1
-  }
-  for (let s = 0; s <= seg; s++) {
-    const nodes = live.filter(n => inSeg(n) === s).sort((a, b) => pos.get(a.id)!.col - pos.get(b.id)!.col || row.get(pos.get(a.id)!.lane)! - row.get(pos.get(b.id)!.lane)!)
-    const lanesHere = [...new Set(nodes.map(n => row.get(pos.get(n.id)!.lane)!))].sort((a, b) => a - b)
-    const taken = new Set<string>()
-    for (const n of nodes) {
-      const c = pos.get(n.id)!.col
-      let r = lanesHere.indexOf(row.get(pos.get(n.id)!.lane)!)
-      if (s > 0) for (const d of n.deps) if (rowOf.has(d) && inSeg(byIdLive.get(d)!) === s) r = Math.max(r, rowOf.get(d)!)
-      while (taken.has(`${c}:${r}`)) r++
-      taken.add(`${c}:${r}`)
-      rowOf.set(n.id, r)
-      segRowsUsed[s] = Math.max(segRowsUsed[s] ?? 0, r + 1)
-    }
-  }
-  const segGap = 10
-  const segH = (s: number) => g.pad * 2 + Math.max(0, (segRowsUsed[s] ?? 1) - 1) * g.pitch + g.h
-  const segY: number[] = [0]
-  for (let s = 1; s <= seg; s++) segY[s] = segY[s - 1]! + segH(s - 1) + segGap
-
-  type Placed = { n: WorkflowNode; x: number; y: number; w: number; cap: Cap; seg: number }
-  const placed = new Map<string, Placed>()
-  for (const n of live) {
-    const s = inSeg(n)
-    if (s < 0) continue
-    const p = pos.get(n.id)!
-    const cap = caps.get(n.id)!
-    placed.set(n.id, { n, x: colX[p.col]!, y: segY[s]! + g.pad + rowOf.get(n.id)! * g.pitch, w: capW(cap, geo), cap, seg: s })
-  }
-  const hidden = live.length - placed.size
-  const all = [...placed.values()]
-  const width = Math.ceil(Math.max(1, ...all.map(p => p.x + p.w)) + 4)
-  const height = segY[seg]! + segH(seg)
-  // 續段的「↳」（SVG 線條，淡色）
-  const cont: string[] = []
-  for (let s = 1; s <= seg; s++) {
-    const cy = segY[s]! + g.pad + g.h / 2
-    cont.push(
-      `<path d="M5,${cy - 9} V${cy} H${3 + INDENT - 6} M${3 + INDENT - 10},${cy - 4} L${3 + INDENT - 6},${cy} L${3 + INDENT - 10},${cy + 4}" ` +
-        `stroke="${P.lineTodo}" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/>`,
+  if (k === 'done') return `<circle cx='${f(cx)}' cy='${f(cy)}' r='6' fill='${T.done}' fill-opacity='.7'/>${check}`
+  if (k === 'doing')
+    return (
+      `<circle class='p' cx='${f(cx)}' cy='${f(cy)}' r='5.25' fill='none' stroke='${T.run}' stroke-width='1.5'/>` +
+      `<circle cx='${f(cx)}' cy='${f(cy)}' r='5.25' fill='none' stroke='${T.run}' stroke-width='1.5'/>` +
+      `<circle cx='${f(cx)}' cy='${f(cy)}' r='2.5' fill='${T.run}'/>`
     )
-  }
+  if (k === 'blocked') return `<circle cx='${f(cx)}' cy='${f(cy)}' r='6' fill='${T.block}'/>${bang('#1f1f1f')}`
+  const op = k === 'ready' ? 0.6 : 0.35
+  return `<circle cx='${f(cx)}' cy='${f(cy)}' r='5.25' fill='none' stroke='${T.ink}' stroke-opacity='${op}' stroke-width='1.5'/>`
+}
 
-  const lines: string[] = []
-  const mid = g.h / 2
-  for (const to of all) {
-    for (const d of to.n.deps) {
-      const from = placed.get(d)
-      if (!from) continue
-      const cls =
-        to.n.status === 'done' || to.n.status === 'doing'
-          ? 'class="ln-done" stroke-width="2"'
-          : 'class="ln-todo" stroke-width="1.5" stroke-dasharray="3 3"'
-      const x1 = from.x + from.w
-      const y1 = from.y + mid
-      const y2 = to.y + mid
-      if (from.seg !== to.seg) {
-        // 跨段不畫線（不留懸空的斷線）；段與段由上而下閱讀，先後關係由清單補充
-        continue
-      } else if (y1 === y2) {
-        lines.push(`<line x1="${x1}" y1="${y1}" x2="${to.x}" y2="${y2}" ${cls}/>`)
-      } else {
-        const xm = to.x - g.gap / 2
-        lines.push(`<path d="M${x1},${y1} H${xm - g.s} C${xm},${y1} ${xm},${y2} ${xm + g.s},${y2} H${to.x}" fill="none" ${cls}/>`)
-      }
+const live = (map: WorkflowMap) => columns(map.nodes.filter(n => n.status !== 'dropped')).flat()
+
+/**
+ * 分段進度條：每步一段（已完成 → 進行中 → 受阻 → 未開始）；段太窄時同狀態併成一段。
+ */
+function segBar(x: number, cy: number, w: number, map: WorkflowMap, T: Theme): string {
+  const order = { done: 0, doing: 1, blocked: 2, todo: 3, dropped: 4 } as const
+  const steps = live(map).sort((a, b) => order[a.status] - order[b.status])
+  const paint = (s: WorkflowNode['status']) =>
+    s === 'done'
+      ? `fill='${T.done}' fill-opacity='.7'`
+      : s === 'doing'
+        ? `fill='${T.run}'`
+        : s === 'blocked'
+          ? `fill='${T.block}'`
+          : `fill='${T.ink}' fill-opacity='.3'`
+  const h = 6
+  const gap = 2
+  const n = steps.length
+  if (n === 0) return `<rect x='${r1(x)}' y='${r1(cy - h / 2)}' width='${r1(w)}' height='${h}' rx='3' ${paint('todo')}/>`
+  let runs: { s: WorkflowNode['status']; k: number }[] = steps.map(s => ({ s: s.status, k: 1 }))
+  // 步驟多（> 12）或每段太窄時，同狀態併成連續一段，不畫成一串點
+  if (n > 12 || (w - gap * (n - 1)) / n < 5) {
+    runs = []
+    for (const s of steps) {
+      const last = runs[runs.length - 1]
+      if (last && last.s === s.status) last.k++
+      else runs.push({ s: s.status, k: 1 })
     }
   }
-  const body = cont.join('') + lines.join('') + all.map(p => capsule(p.cap, p.x, p.y, geo)).join('')
-  return { source: svgDoc(width, height, body), width, height, hidden }
+  const unit = (w - gap * (runs.length - 1)) / n
+  let at = x
+  return runs
+    .map(r => {
+      const sw = Math.max(3, unit * r.k)
+      const out = `<rect x='${r1(at)}' y='${r1(cy - h / 2)}' width='${r1(sw)}' height='${h}' rx='${r1(Math.min(3, sw / 2))}' ${paint(r.s)}/>`
+      at += sw + gap
+      return out
+    })
+    .join('')
 }
 
-/** 全圖面板的圖例：一行膠囊（狀態名稱按語言）。 */
-export function legendSvg(lang: Lang): SvgResult {
+const amber = (cx: number, cy: number, T: Theme) => `<circle cx='${r1(cx)}' cy='${r1(cy)}' r='3' fill='${T.block}'/>`
+
+// ---------------- 收起／展開的標題行 ----------------
+
+/** 標題行左邊說甚麼：進行中（多個時「+N」）；沒有進行中時是下一步或受阻；全部完成。 */
+export function headline(map: WorkflowMap, view: StageView, lang: Lang) {
   const t = STR[lang]
-  const caps: Cap[] = [
-    { text: t.status.done, kind: 'done', check: true, title: t.status.done },
-    { text: t.status.doing, kind: 'doing', title: t.status.doing },
-    { text: t.ready, kind: 'ready', next: true, title: t.ready },
-    { text: t.status.todo, kind: 'todo', title: t.status.todo },
-    { text: t.status.blocked, kind: 'blocked', title: t.status.blocked },
-    { text: t.insertCount, kind: 'ins', ins: true, title: t.insertCount },
-  ]
-  return capsRow(caps, 4000, { h: 20, font: 11 })
+  const ready = readyIds(map.nodes)
+  if (allDone(map)) return { k: 'done' as Kind, ins: false, name: t.allDone, plus: 0, next: [] as string[] }
+  const doing = live(map).filter(n => n.status === 'doing')
+  const first = view.levels[0] ?? []
+  const lead = doing[0] ?? first.find(n => ready.has(n.id)) ?? first[0]
+  if (!lead) return { k: 'todo' as Kind, ins: false, name: '', plus: 0, next: [] }
+  const next = [...first.filter(n => n !== lead && n.status !== 'doing' && ready.has(n.id)), ...(view.levels[1] ?? [])]
+    .filter(n => n.status !== 'blocked')
+    .map(n => n.title)
+  return { k: kindOf(lead, ready), ins: !!lead.inserted, name: lead.title, plus: Math.max(0, doing.length - 1), next }
 }
 
-/** 全圖面板頂部的整體進度細條（數字由介面的 Text 顯示，跟主題配色）。 */
-export function progressSvg(map: WorkflowMap, width = 420): SvgResult {
+const ROW_H = 24
+const ICON_X = 11
+const LABEL_X = 24
+
+/**
+ * 標題行（24px 高），分成兩張圖：左 = 狀態點 + 名稱（+N）+「下一步：」；右 = 分段進度條 + 6/11（+ 琥珀點）。
+ * 中間由介面的空白撐開，右邊永遠貼住按鈕；avail 估大估細只影響進度條長度。
+ */
+export function bandHeader(map: WorkflowMap, view: StageView, lang: Lang, T: Theme, avail: number, pending: boolean) {
+  const t = STR[lang]
   const s = stats(map)
-  const ratio = s.total ? s.done / s.total : 0
-  const source = svgDoc(
-    width,
-    10,
-    `<rect class="f-track" x="0" y="2" width="${width}" height="6" rx="3"/>` +
-      `<rect class="f-prog" x="0" y="2" width="${(width * ratio).toFixed(1)}" height="6" rx="3"/>`,
+  const h = headline(map, view, lang)
+  const count = `${s.done}/${s.total}`
+  const countW = tw(count)
+  const meterTail = 10 + countW + (pending ? 12 : 0)
+  const cy = ROW_H / 2
+  // 名稱最多佔四成；「下一步」只在放得下（進度條仍有 120px）時才出現
+  const name = fit(h.name, 12, Math.min(280, Math.max(60, avail * 0.4)))
+  const plus = h.plus ? `+${h.plus}` : ''
+  let x = LABEL_X + tw(name) + (plus ? 6 + tw(plus) : 0)
+  let nextText = ''
+  const room = avail - x - 16 - (120 + meterTail) - 16
+  if (h.next.length && room >= 80) {
+    const max = Math.min(room, 320)
+    nextText = fit(`${t.upNext}${h.next[0]}`, 11, max)
+    for (const more of h.next.slice(1)) {
+      const longer = `${nextText} · ${more}`
+      if (tw(longer, 11) > max) break
+      nextText = longer
+    }
+    if (nextText) x += 16 + tw(nextText, 11)
+  }
+  const lead = doc(
+    x + 2,
+    ROW_H,
+    T,
+    icon(h.k, h.ins, ICON_X, cy, T) +
+      text(LABEL_X, cy + 4, name, h.k === 'done' ? '' : 'b', { fixed: true }) +
+      (plus ? text(LABEL_X + tw(name) + 6, cy + 4, plus, 'd', { fixed: true }) : '') +
+      (nextText ? text(x - tw(nextText, 11), cy + 4, nextText, 'm', { fixed: true }) : ''),
   )
-  return { source, width, height: 10, hidden: 0 }
+  const barW = Math.round(Math.min(360, Math.max(80, avail - x - 24 - meterTail)))
+  const meter = doc(
+    barW + meterTail,
+    ROW_H,
+    T,
+    segBar(0, cy, barW, map, T) + text(barW + 10, cy + 4, count, '', { fixed: true }) + (pending ? amber(barW + 10 + countW + 8, cy, T) : ''),
+  )
+  return { lead, meter }
 }
 
-/** 清單用的狀態小圖示（16×16）：✓ 已完成、▶ 進行中、→ 可開始、○ 未開始、! 受阻、– 已取消。全部 SVG 線條／形狀。 */
-export function statusIcon(kind: 'done' | 'doing' | 'ready' | 'todo' | 'blocked' | 'dropped'): SvgResult {
-  const body =
-    kind === 'done'
-      ? `<path d="M3,8.5 L6.5,12 L13,4.5" stroke="${P.accent}" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>`
-      : kind === 'doing'
-        ? `<circle cx="8" cy="8" r="7" fill="${P.doing.fill}"/><path d="M6.3,4.8 L11.2,8 L6.3,11.2 Z" fill="#ffffff"/>`
-        : kind === 'ready'
-          ? `<path d="M2.5,8 H13 M9,4 L13,8 L9,12" stroke="${P.accent}" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>`
-          : kind === 'blocked'
-            ? `<circle cx="8" cy="8" r="7" fill="${P.blocked.fill}"/><path d="M8,4 V9 M8,11.8 V12" stroke="#ffffff" stroke-width="2" stroke-linecap="round"/>`
-            : kind === 'dropped'
-              ? `<path d="M4,8 H12" stroke="rgba(128,128,128,.8)" stroke-width="2" stroke-linecap="round"/>`
-              : `<circle cx="8" cy="8" r="5.5" fill="none" stroke="rgba(128,128,128,.85)" stroke-width="1.6"/>`
-  return { source: svgDoc(16, 16, body), width: 16, height: 16, hidden: 0 }
+// ---------------- 展開：GitHub Actions 式卡片 ----------------
+
+type CardRow = { k?: Kind; ins?: boolean; label: string; cls?: string }
+type Card = { rows: CardRow[]; w: number; hot: boolean }
+
+const CARD_ROW = 18
+const CARD_GAP = 24
+const MAX_LABEL = 150
+
+function card(rows: CardRow[], hot: boolean): Card {
+  const fitted = rows.map(r => ({ ...r, label: fit(r.label, 12, MAX_LABEL) }))
+  const w = Math.max(...fitted.map(r => (r.k ? LABEL_X : 10) + tw(r.label) + 10))
+  return { rows: fitted, w, hot }
 }
 
-/** 插入記號 ⊕（16×16），與膠囊內的一致。 */
-export function insertIcon(): SvgResult {
-  return { source: svgDoc(16, 16, insMark(8, 8, 6.5)), width: 16, height: 16, hidden: 0 }
+/**
+ * 卡片圖（≤ 3 行高）：[✓ 9 已完成] — [同層並行步驟一張卡] — … — [+5 稍後]。
+ * 卡頂對齊，連接點在第一行中線，所以線都是直的、不會交叉。放不下的層算進「稍後」。
+ */
+export function bandGraph(map: WorkflowMap, view: StageView, lang: Lang, T: Theme, maxW: number): Pic & { hidden: number } {
+  const t = STR[lang]
+  const ready = readyIds(map.nodes)
+  const cards: Card[] = []
+  let used = 0
+  const push = (c: Card) => {
+    cards.push(c)
+    used += (cards.length > 1 ? CARD_GAP : 0) + c.w
+  }
+  if (view.done.length) push(card([{ k: 'done', label: t.doneCard(view.done.length) }], false))
+  let later = [...view.later]
+  view.levels.forEach((lv, i) => {
+    if (later.length > view.later.length) return later.push(...lv)
+    const shown = lv.length > 3 ? lv.slice(0, 2) : lv
+    const rows: CardRow[] = shown.map(n => ({ k: kindOf(n, ready), ins: !!n.inserted, label: n.title }))
+    if (lv.length > 3) rows.push({ label: t.moreRows(lv.length - 2), cls: 'd' })
+    const c = card(rows, lv.some(n => n.status === 'doing'))
+    const rest = later.length + view.levels.slice(i + 1).flat().length
+    const reserve = rest ? CARD_GAP + 20 + tw(t.laterCard(rest + lv.length)) + 20 : 0
+    if (i > 0 && used + CARD_GAP + c.w + reserve > maxW) return later.push(...lv)
+    push(c)
+  })
+  later = later.filter((n, i, a) => a.indexOf(n) === i)
+  if (later.length) {
+    const ins = later.some(n => n.inserted)
+    push(card([{ k: ins ? 'todo' : undefined, ins, label: t.laterCard(later.length), cls: 'd' }], false))
+  }
+  // 卡先畫，線與連接點後畫（點蓋在卡邊上）
+  const parts: string[] = []
+  const wires: string[] = []
+  const portY = 0.5 + 1 + CARD_ROW / 2
+  let x = 0
+  let height = 0
+  const dot = (cx: number, hot: boolean) =>
+    `<circle cx='${r1(cx)}' cy='${portY}' r='2.5' ${hot ? `fill='${T.run}'` : `fill='${T.ink}' fill-opacity='.3'`}/>`
+  cards.forEach((c, i) => {
+    if (i > 0) {
+      const x1 = x - CARD_GAP
+      const stroke = c.hot ? `stroke='${T.run}'` : `stroke='${T.ink}' stroke-opacity='.22'`
+      wires.push(`<path d='M${r1(x1)},${portY} H${r1(x)}' ${stroke} stroke-width='1.5'/>`, dot(x1, c.hot), dot(x, c.hot))
+    }
+    const h = 2 + c.rows.length * CARD_ROW
+    height = Math.max(height, h + 1)
+    parts.push(
+      `<rect x='${r1(x + 0.5)}' y='0.5' width='${r1(c.w - 1)}' height='${h}' rx='4' fill='${T.ink}' fill-opacity='.06' stroke='${T.ink}' stroke-opacity='.16'/>`,
+    )
+    c.rows.forEach((r, j) => {
+      const cy = 0.5 + 1 + j * CARD_ROW + CARD_ROW / 2
+      if (r.k) parts.push(icon(r.k, !!r.ins, x + ICON_X, cy, T))
+      parts.push(text(x + (r.k ? LABEL_X : 10), cy + 4, r.label, r.cls ?? '', { fixed: true }))
+    })
+    x += c.w + CARD_GAP
+  })
+  const hidden = later.length
+  // 與標題行之間留 4px
+  return { ...doc(x - CARD_GAP + 1, height + 4, T, `<g transform='translate(0,4)'>${parts.join('')}${wires.join('')}</g>`), hidden }
+}
+
+// ---------------- 全圖：GitLab 式階段卡（由上而下） ----------------
+
+/** ISO → 本地 MM-DD HH:MM；缺少或無效（含 1970 起點）時回傳空字串。 */
+export function fmtTime(iso: string | undefined): string {
+  const d = new Date(iso ?? '')
+  if (!iso || Number.isNaN(d.getTime()) || d.getTime() <= 86_400_000) return ''
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
+/** 全圖標題行左邊（24px 高）：分段進度條撐滿 + 16 / 23 + 「3 進行中 · 1 受阻」（+ 琥珀點、未記錄）。 */
+export function paneMeter(map: WorkflowMap, lang: Lang, T: Theme, width: number, pending: boolean): Pic {
+  const t = STR[lang]
+  const s = stats(map)
+  const ready = readyIds(map.nodes)
+  const blocked = map.nodes.filter(n => n.status === 'blocked').length
+  const count = `${s.done} / ${s.total}`
+  const status = allDone(map) ? t.allDone : t.statusLine(s.doing.length, blocked, ready.size)
+  // 太窄時先丟「未記錄」字樣、再丟狀態字，進度條至少 96px
+  const tails = [[status, pending ? t.unlogged : ''], [status], []].map(a => a.filter(Boolean).join(' · '))
+  const wOf = (tail: string) => 12 + tw(count) + (pending ? 14 : 0) + (tail ? 12 + tw(tail, 11) : 0)
+  const tail = tails.find(x => width - wOf(x) >= 96) ?? ''
+  const textW = wOf(tail)
+  const barW = Math.max(80, Math.round(width - textW))
+  const cy = ROW_H / 2
+  let x = barW + 12
+  let body = segBar(0, cy, barW, map, T) + text(x, cy + 4, count, 'b', { fixed: true })
+  x += tw(count)
+  if (pending) {
+    body += amber(x + 8, cy, T)
+    x += 14
+  }
+  if (tail) body += text(x + 12, cy + 4, tail, 'm', { fixed: true })
+  return doc(barW + textW, ROW_H, T, body)
+}
+
+type PaneRow = { k: Kind; ins: boolean; title: string; meta: string; metaCls: string; sub: string }
+type PaneCard = { head: string; headIcon?: Kind; headCls: string; rows: PaneRow[]; note?: string; hot: boolean }
+
+const HEAD = 28
+const PROW = 24
+const PROW2 = 40
+const PAD_B = 6
+const STACK_GAP = 16
+const P_ICON = 20
+const P_TEXT = 34
+
+/**
+ * 階段卡：[已完成 9 項]（收起；展開時列出）→ 階段 1…（每層一張，列出步驟）→ [稍後 5 項]。
+ * 每列：狀態圖示 + 名稱 + 右邊淡色狀態；插入的步驟左邊紫色細線 + 菱形 + 第二行（時間 · 用戶的話）；
+ * 未能開始的步驟第二行「← 待 A、B」。卡與卡之間一小段直線。
+ */
+export function paneStages(map: WorkflowMap, view: StageView, o: { lang: Lang; T: Theme; width: number; doneOpen: boolean }): Pic {
+  const t = STR[o.lang]
+  const T = o.T
+  const W = Math.round(o.width)
+  const ready = readyIds(map.nodes)
+  const byId = new Map(map.nodes.map(n => [n.id, n]))
+  const row = (n: WorkflowNode): PaneRow => {
+    const k = kindOf(n, ready)
+    const waiting = n.deps.map(d => byId.get(d)).filter((d): d is WorkflowNode => !!d && d.status !== 'done' && d.status !== 'dropped')
+    const sub = [
+      n.inserted ? [fmtTime(n.inserted.at), n.inserted.note].filter(Boolean).join(' · ') : '',
+      (k === 'todo' || k === 'blocked') && waiting.length ? `← ${t.waitShort(waiting.map(d => d.title).join(t.list))}` : '',
+    ]
+      .filter(Boolean)
+      .join(' · ')
+    const meta = k === 'doing' ? t.status.doing : k === 'blocked' ? t.status.blocked : k === 'ready' ? t.ready : ''
+    return { k, ins: !!n.inserted, title: n.title, meta, metaCls: k === 'doing' ? 'm r' : k === 'blocked' ? 'm a' : 'm', sub }
+  }
+  const cards: PaneCard[] = []
+  if (view.done.length) {
+    const open = o.doneOpen || !view.foldDone
+    cards.push({ head: t.doneStage(view.done.length), headIcon: open ? undefined : 'done', headCls: 'b', rows: open ? view.done.map(row) : [], hot: false })
+  }
+  view.levels.forEach((lv, i) =>
+    cards.push({ head: t.stage(i + 1, lv.length), headCls: 'b', rows: lv.map(row), hot: lv.some(n => n.status === 'doing') }),
+  )
+  if (view.later.length)
+    cards.push({ head: t.laterStage(view.later.length), headCls: 'b d', rows: [], note: view.later.map(n => n.title).join(' · '), hot: false })
+
+  const parts: string[] = []
+  const wires: string[] = []
+  let y = 8.5 // 與標題行之間 8px
+  const line = (hot: boolean) => (hot ? `stroke='${T.run}'` : `stroke='${T.ink}' stroke-opacity='.22'`)
+  const dot = (cy: number, hot: boolean) => `<circle cx='${P_ICON}' cy='${r1(cy)}' r='2.5' ${hot ? `fill='${T.run}'` : `fill='${T.ink}' fill-opacity='.3'`}/>`
+  cards.forEach((c, i) => {
+    if (i > 0) {
+      const top = y - STACK_GAP
+      wires.push(`<path d='M${P_ICON},${r1(top)} V${r1(y)}' ${line(c.hot)} stroke-width='1.5'/>`, dot(top, c.hot), dot(y, c.hot))
+    }
+    const rowsH = c.rows.reduce((s, r) => s + (r.sub ? PROW2 : PROW), 0)
+    const h = c.rows.length ? HEAD + 2 + rowsH + PAD_B : c.note ? HEAD + 20 : 32
+    parts.push(`<rect x='0.5' y='${r1(y)}' width='${W - 1}' height='${h}' rx='8' fill='${T.ink}' fill-opacity='.05' stroke='${T.ink}' stroke-opacity='.16'/>`)
+    const headY = y + 20
+    if (c.headIcon) parts.push(icon(c.headIcon, false, P_ICON, headY - 4, T))
+    parts.push(text(c.headIcon ? P_TEXT : 14, headY, fit(c.head, 12, W - 48), c.headCls))
+    if (c.note) parts.push(text(14, y + HEAD + 9, fit(c.note, 11, W - 28), 'm'))
+    let ry = y + HEAD + 2
+    for (const r of c.rows) {
+      const rh = r.sub ? PROW2 : PROW
+      const cy = ry + PROW / 2
+      if (r.ins) parts.push(`<rect x='4' y='${r1(ry + 4)}' width='2' height='${rh - 8}' rx='1' fill='${T.ins}'/>`)
+      parts.push(icon(r.k, r.ins, P_ICON, cy, T))
+      const metaW = r.meta ? tw(r.meta, 11) + 12 : 0
+      parts.push(text(P_TEXT, cy + 4, fit(r.title, 12, W - P_TEXT - 14 - metaW), r.k === 'todo' ? 'd' : ''))
+      if (r.meta) parts.push(text(W - 14, cy + 4, r.meta, r.metaCls, { end: true }))
+      if (r.sub) parts.push(text(P_TEXT, cy + 20, fit(r.sub, 11, W - P_TEXT - 14), 'm'))
+      ry += rh
+    }
+    y += h + STACK_GAP
+  })
+  return doc(W, y - STACK_GAP + 1, T, parts.join('') + wires.join(''))
 }

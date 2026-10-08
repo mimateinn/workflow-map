@@ -3,11 +3,11 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { WorkflowMap, WorkflowNode } from '../types/index'
 import { DEMO_MAP } from './demo'
-import { allDone, applyOp, columns, compactLine, emptyMap, GLYPH, isActive, plainLines, readyIds, STATUSES, textDiagram, validateMap } from './graph'
+import { allDone, applyOp, compactLine, emptyMap, GLYPH, isActive, plainLines, readyIds, STATUSES, stageView, stats, textDiagram, validateMap } from './graph'
 import type { Op } from './graph'
-import { pickLang, STR } from './i18n'
+import { detectLang, resolveLang, STR } from './i18n'
 import type { Lang } from './i18n'
-import { capsRow, insertIcon, metroSvg, pendingDot, progressSvg, statusIcon, summaryCaps, summaryText } from './svg'
+import { bandGraph, bandHeader, fmtTime, PANE_PX_PER_COL, paneMeter, paneStages, PX_PER_COL, THEMES, tw } from './svg'
 
 const TOOL = 'mcp__workflow-map__workflow_map'
 const PANE = 'workflow-map'
@@ -20,12 +20,16 @@ const DONE_TURNS = atom({ plugin: 'workflow-map', key: 'doneTurns' } as const, 0
 /** /workflow-demo：只在畫面顯示示範資料，不寫檔、不碰真資料 */
 const DEMO = atom({ plugin: 'workflow-map', key: 'demo' } as const, false)
 const DONE_OPEN = atom({ plugin: 'workflow-map', key: 'doneOpen' } as const, false)
-/** 次要文字色：深色背景約 4.9:1、白底約 3.4:1（types 沒有主題 API，以使用者的深色主題為準） */
-const DIM = '#8e8e96'
-const INS_ICON = insertIcon()
-const PENDING_DOT = pendingDot()
-/** 桌面版一格字約多少 px（types 沒有提供，保守估算） */
-const CELL_PX = 7
+const FUTURE_OPEN = atom({ plugin: 'workflow-map', key: 'futureOpen' } as const, false)
+/** 本輪開始時間：本輪新插入的步驟在聚焦時一定顯示 */
+const TURN_AT = atom({ plugin: 'workflow-map', key: 'turnAt' } as const, 0)
+/** 聚焦的展開狀態在計劃改變、重開全圖時回到收起 */
+const foldAll = async ($: $) => {
+  if (await read($, DONE_OPEN)) await update($, DONE_OPEN, () => false)
+  if (await read($, FUTURE_OPEN)) await update($, FUTURE_OPEN, () => false)
+}
+/** app 主題是淺色（/config 的 theme 含 light）；Svg 以圖片繪製讀不到主題，所以自己記住 */
+const LIGHT = atom({ plugin: 'workflow-map', key: 'light' } as const, false)
 
 const WORDING =
   "Titles and notes: in the user's own language (its written form), concise, plain words, no jargon or file names; " +
@@ -80,9 +84,29 @@ const HINT =
 
 type $ = EngineInterface
 
-/** userConfig `language`：auto | zh-Hant | en（每次載入由 register 設定） */
+async function refreshTheme($: $) {
+  try {
+    const v = (await $.config.list()).find(r => r.key === 'theme')?.value
+    const light = typeof v === 'string' && v.includes('light')
+    if (light !== (await read($, LIGHT))) await update($, LIGHT, () => light)
+  } catch {
+    // 讀不到設定：維持深色
+  }
+}
+const themeOf = async ($: $) => THEMES[(await read($, LIGHT)) ? 'light' : 'dark']
+
+/** userConfig `language`：auto | zh-Hant | zh-Hans | en（每次載入由 register 設定） */
 let languageSetting: unknown = 'auto'
-const langOf = (map: WorkflowMap): Lang => pickLang(languageSetting, map.nodes.map(n => n.title).join(''))
+/** 用戶最近一次輸入的文字判斷出的語言（存在 $.store，跨 session） */
+const LANG = atom({ plugin: 'workflow-map', key: 'lang' } as const, '')
+/**
+ * $.store 的鍵帶版本：舊鍵 'lang' 由有問題的偵測寫入（子代理的簡體文字也算），一律棄用。
+ * 偵測規則再改時把版本加一。
+ */
+const LANG_KEY = 'langV2'
+/** 設定 → 用戶輸入過的語言 → 計劃步驟名稱的文字（弱證據：模型用用戶的語言寫）→ 英文 */
+const langNow = async ($: $): Promise<Lang> =>
+  resolveLang(languageSetting, await read($, LANG), detectLang((await shownMap($)).nodes.map(n => n.title).join(' ')))
 
 /** 示範資料的插入時間按現在推算（40 分鐘前、5 分鐘前…），只在畫面使用 */
 async function demoMap($: $): Promise<WorkflowMap> {
@@ -125,7 +149,7 @@ export async function loadMap($: $): Promise<WorkflowMap> {
   await $.fs.write(backup, text)
   const empty = emptyMap()
   await $.fs.write(path, `${JSON.stringify(empty, null, 2)}\n`)
-  $.ui.toast(STR[pickLang(languageSetting, text)].corrupt(problem, backup.split('/').pop() ?? backup))
+  $.ui.toast(STR[await langNow($)].corrupt(problem, backup.split('/').pop() ?? backup))
   return empty
 }
 
@@ -136,16 +160,19 @@ export const register: Register = (on, options) => {
 
   on('session.start', async ($, e, next) => {
     await $.tool.register({ name: 'workflow_map', description: DESCRIPTION, inputSchema: SCHEMA, isDeferred: false })
+    await refreshTheme($)
     const expanded = (await $.store.get('expanded')) === true
     await update($, EXPANDED, () => expanded)
+    const storedLang = await $.store.get(LANG_KEY)
+    if (typeof storedLang === 'string') await update($, LANG, () => storedLang)
     let map = emptyMap()
     try {
       map = await loadMap($)
       await update($, MAP, () => map)
     } catch (err) {
-      $.ui.toast(STR[pickLang(languageSetting, '')].readFail(String(err).slice(0, 200)))
+      $.ui.toast(STR[await langNow($)].readFail(String(err).slice(0, 200)))
     }
-    const t = STR[langOf(map)]
+    const t = STR[await langNow($)]
     await $.command
       .register({ name: 'workflow', description: t.commandDesc })
       .catch(() => $.command.register({ name: 'workflow-map', description: t.commandDesc }))
@@ -171,6 +198,12 @@ export const register: Register = (on, options) => {
     deny: `workflow_map failed (${next.error?.kind ?? 'unknown'}); nothing was changed.`,
   }))
 
+  on('config.set', async ($, e, next) => {
+    const r = await next(e)
+    if (e.key === 'theme') await refreshTheme($)
+    return r
+  })
+
   on('prompt.compose', async ($, e, next) => {
     const r = await next(e)
     if (!e.tools.includes(TOOL)) return r
@@ -178,10 +211,25 @@ export const register: Register = (on, options) => {
   })
 
   // 安全網：計劃進行中用戶再發訊息 → 標示「未記錄」並提示模型一句；不自動新增步驟。
+  // 只算用戶親手輸入的訊息（composer／bridge）：子代理通知、其他 session、排程、外掛的文字都不算，
+  // 否則它們的簡體字會把介面語言改走，亦會誤標「新要求未記錄」。
   on('prompt.submit', async ($, e, next) => {
-    if (e.origin.kind === 'plugin' || !isActive(await read($, MAP))) return next(e)
+    if (e.origin.kind !== 'composer' && e.origin.kind !== 'bridge') return next(e)
+    // 介面語言跟用戶：以用戶最近一次輸入的文字判斷，存起來（不看模型寫的步驟名稱）
+    const detected = detectLang(e.text)
+    if (detected && detected !== (await read($, LANG))) {
+      await update($, LANG, () => detected)
+      await $.store.set(LANG_KEY, detected)
+    }
+    if (!isActive(await read($, MAP))) return next(e)
     await update($, PENDING, () => true)
     return next({ ...e, context: [...(e.context ?? []), HINT] })
+  })
+
+  on('turn.start', async ($, e, next) => {
+    const now = await $.clock.now()
+    await update($, TURN_AT, () => now)
+    return next(e)
   })
 
   on('turn.complete', async ($, e, next) => {
@@ -196,55 +244,50 @@ export const register: Register = (on, options) => {
   on('command.run', { command: 'workflow-demo' }, async $ => {
     const isOn = !(await read($, DEMO))
     await update($, DEMO, () => isOn)
-    const t = STR[langOf(isOn ? DEMO_MAP : await read($, MAP))]
+    const t = STR[await langNow($)]
     return { text: isOn ? t.demoOn : t.demoOff }
   })
 
   on('command.run', { command: ['workflow', 'workflow-map'] }, async $ => {
     const map = await shownMap($)
-    const lang = langOf(map)
+    const lang = await langNow($)
+    await foldAll($)
     await openPane($, lang)
     return { text: map.nodes.length ? `${STR[lang].paneOpened} ${compactLine(map, lang)}` : STR[lang].empty }
   })
 
-  // 輸入框上方。收起：一行膠囊（進度膠囊 → 進行中 → 下一步 → 插入）；展開：地鐵線 + 膠囊（≤ 3 條線）。
-  // 右邊：一個隨狀態切換的圖示按鈕（▾ 展開／▴ 收起）；有放不下的步驟時多一個「+N」按鈕開全圖。
+  // 輸入框上方。收起：一行「● 進行中  接下來：…  ━━━── 6/11」；展開：再加一行 GitHub Actions 式卡片圖。
+  // 右邊固定兩個控制：展開／收起、開全圖。數字都在圖內，不是按鈕。
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey) return next(e)
     const map = await shownMap($)
     if (map.nodes.length === 0) return next(e)
     // 全部完成後只顯示一輪，之後隱藏
     if (allDone(map) && (await read($, DONE_TURNS)) >= 2) return next(e)
-    const lang = langOf(map)
+    const lang = await langNow($)
     const t = STR[lang]
     const expanded = await read($, EXPANDED)
     const pending = await read($, PENDING)
     const table = $.ui.resolve(e)
     const { Box, Text, Button } = table
     const Svg = e.surface !== 'terminal' && 'Svg' in table ? table.Svg : undefined
-    const lines = plainLines(map, lang)
-    // 圖可用的闊度：欄數 × CELL_PX，扣去右邊按鈕；types 沒有橫向捲動，放不下的收成「+N」按鈕
-    const room = Math.max(200, Math.round((e.props.bodyColumns || 100) * CELL_PX) - 90)
-
-    const controls = (hidden: number) => (
-      <Box flexDirection="row" gap={1} flexShrink={0} paddingRight={1}>
-        {pending && (expanded || !Svg) ? (
-          Svg ? <Svg source={PENDING_DOT.source} alt={t.unloggedTip} width={14} height={14} /> : <Text color="warning">●</Text>
-        ) : null}
-        {hidden > 0 ? <Button key="more" plain label={`+${hidden}`} onPress={() => openPane($, lang)} /> : null}
-        <Button key="toggle" plain label={expanded ? '▴' : '▾'} onPress={() => toggle($)} />
+    const controls = (
+      <Box key="ctl" flexDirection="row" flexShrink={0} gap={1}>
+        <Button key="toggle" plain dimColor label={expanded ? '▴' : '▾'} onPress={() => toggle($)} />
+        <Button key="open" plain dimColor label="↗" onPress={() => openPane($, lang)} />
       </Box>
     )
 
     if (!Svg) {
-      const shown = expanded ? lines.slice(0, 6) : []
+      const shown = expanded ? plainLines(map, lang).slice(0, 6) : []
       return (
         <Box flexDirection="column">
           <Box flexDirection="row" gap={1}>
             <Box flexShrink={1} flexGrow={1}>
-              <Text wrap="truncate-end">{summaryText(map, pending, lang)}</Text>
+              <Text wrap="truncate-end">{compactLine(map, lang)}</Text>
             </Box>
-            {controls(expanded ? lines.length - shown.length : 0)}
+            {pending ? <Text color="warning">●</Text> : null}
+            {controls}
           </Box>
           {shown.map(line => (
             <Text wrap="truncate-end">{line}</Text>
@@ -253,104 +296,115 @@ export const register: Register = (on, options) => {
       )
     }
 
-    const pic = expanded
-      ? metroSvg(map, { lanes: 3, maxWidth: room, compact: true, lang })
-      : capsRow(summaryCaps(map, pending, lang), room)
+    const T = await themeOf($)
+    const view = stageView(map, { freshSince: await read($, TURN_AT) })
+    // 可用闊度：欄數 × 每格 px（寧小勿大），扣去兩個按鈕
+    const avail = Math.max(240, Math.round((e.props.bodyColumns || 100) * PX_PER_COL) - 56)
+    const head = bandHeader(map, view, lang, T, avail, pending)
+    const graph = expanded ? bandGraph(map, view, lang, T, avail + 56) : undefined
+    const s = stats(map)
     return (
-      <Box flexDirection="row" gap={1} alignItems="flex-start">
-        <Box flexShrink={1} overflow="hidden">
-          {/* 圖片模式（非 isInteractive）：透明底；寬高 = viewBox，1:1 不縮放 */}
-          <Svg source={pic.source} alt={[compactLine(map, lang), ...lines].join('\n')} width={pic.width} height={pic.height} />
+      <Box flexDirection="column">
+        <Box flexDirection="row" alignItems="center" gap={1}>
+          {/* 圖片模式（非 isInteractive）：透明底；寬高 = viewBox，1:1 不縮放。左右兩張圖之間由空白撐開，進度條永遠貼住按鈕 */}
+          <Box flexShrink={1} overflow="hidden">
+            <Svg source={head.lead.source} alt={compactLine(map, lang)} width={head.lead.width} height={head.lead.height} />
+          </Box>
+          <Box flexGrow={1} />
+          <Box flexShrink={0}>
+            <Svg
+              source={head.meter.source}
+              alt={[t.progressTip(s.done, s.total), pending ? t.unloggedTip : ''].filter(Boolean).join('\n')}
+              width={head.meter.width}
+              height={head.meter.height}
+            />
+          </Box>
+          {controls}
         </Box>
-        <Box flexGrow={1} />
-        {controls(pic.hidden)}
+        {graph ? (
+          <Box>
+            <Svg source={graph.source} alt={plainLines(map, lang).join('\n')} width={graph.width} height={graph.height} />
+          </Box>
+        ) : null}
       </Box>
     )
   })
 
-  // 全圖面板：標題 + 進度條 → 完整地鐵圖（放不下就換段，保證全部步驟都畫）→ 進行中／接下來／已完成三組短清單。
+  // 全圖面板：標題行（分段進度條撐滿 + 16 / 23 + 狀態；右邊兩個收放按鈕）→ 階段卡（由上而下，一張圖）。
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const map = await shownMap($)
-    const lang = langOf(map)
+    const lang = await langNow($)
     const t = STR[lang]
     const table = $.ui.resolve(e)
     const { Box, Text, Button } = table
     const Svg = e.surface !== 'terminal' && 'Svg' in table ? table.Svg : undefined
-    if (map.nodes.length === 0) return <Text color={DIM}>{t.empty}</Text>
+    if (map.nodes.length === 0) return <Text dimColor>{t.empty}</Text>
     const doneOpen = await read($, DONE_OPEN)
+    const futureOpen = await read($, FUTURE_OPEN)
+    const turnAt = await read($, TURN_AT)
     const pending = await read($, PENDING)
-    const byId = new Map(map.nodes.map(n => [n.id, n]))
-    const ready = readyIds(map.nodes)
-    const order = columns(map.nodes).flat()
-    const doing = order.filter(n => n.status === 'doing')
-    const upNext = order.filter(n => n.status === 'todo' || n.status === 'blocked')
-    const done = order.filter(n => n.status === 'done')
-    const total = map.nodes.filter(n => n.status !== 'dropped').length
-    const paneRoom = Math.max(320, Math.round(((e.props as { bodyColumns?: number }).bodyColumns ?? 120) * CELL_PX) - 24)
-    const barW = Math.min(200, Math.max(80, paneRoom - 260))
+    const view = stageView(map, { freshSince: turnAt, expandDone: doneOpen, expandFuture: futureOpen })
+    // 收放按鈕只在有東西可收時出現（以「不展開」時的視圖判斷）
+    const base = stageView(map, { freshSince: turnAt })
+    const folds = [
+      base.foldDone ? { key: 'fold-done', label: doneOpen ? t.hideDone : t.showDone, onPress: () => update($, DONE_OPEN, v => !v) } : undefined,
+      base.later.length ? { key: 'fold-future', label: futureOpen ? t.hideLater : t.showLater, onPress: () => update($, FUTURE_OPEN, v => !v) } : undefined,
+    ].filter(b => b !== undefined)
+    const buttons = folds.map(b => <Button key={b.key} variant="secondary" label={b.label} onPress={b.onPress} />)
+    const s = stats(map)
 
-    const kindOf = (n: WorkflowNode) => (n.status === 'todo' && ready.has(n.id) ? 'ready' : n.status)
-    const row = (n: WorkflowNode) => {
-      const waiting = n.deps.map(d => byId.get(d)).filter(d => d && d.status !== 'done' && d.status !== 'dropped')
-      const sub = [
-        n.inserted ? [fmtTime(n.inserted.at), n.inserted.note].filter(Boolean).join(' · ') : '',
-        (n.status === 'todo' || n.status === 'blocked') && waiting.length ? t.waitShort(waiting.map(d => d!.title).join(t.list)) : '',
-      ]
-        .filter(Boolean)
-        .join(' · ')
-      const icon = statusIcon(kindOf(n))
+    if (!Svg) {
+      const ready = readyIds(map.nodes)
+      const row = (n: (typeof map.nodes)[number]) => (
+        <Text wrap="truncate-end">
+          {`  ${GLYPH[n.status]} ${n.title}${n.status === 'todo' && ready.has(n.id) ? ` (${t.ready})` : ''}${
+            n.inserted ? `  ⊕ ${[fmtTime(n.inserted.at), n.inserted.note].filter(Boolean).join(' · ')}` : ''
+          }`}
+        </Text>
+      )
       return (
-        <Box flexDirection="column">
-          <Box flexDirection="row" gap={1} alignItems="center">
-            {Svg ? <Svg source={icon.source} alt={t.status[n.status]} width={16} height={16} /> : <Text>{GLYPH[n.status]}</Text>}
-            {n.inserted ? Svg ? <Svg source={INS_ICON.source} alt={t.insertCount} width={16} height={16} /> : <Text>⊕</Text> : null}
-            <Text wrap="truncate-end">{n.title}</Text>
+        <Box flexDirection="column" paddingX={1}>
+          <Box flexDirection="row" gap={1}>
+            <Text>{`${s.done}/${s.total}`}</Text>
+            {pending ? <Text color="warning">●</Text> : null}
+            <Box flexGrow={1} />
+            {buttons}
           </Box>
-          {sub ? (
-            <Box paddingLeft={3}>
-              <Text color={DIM} wrap="truncate-end">
-                {sub}
-              </Text>
+          {view.done.length ? <Text bold>{t.doneStage(view.done.length)}</Text> : null}
+          {view.done.length && !(view.foldDone && !doneOpen) ? view.done.map(row) : null}
+          {view.levels.map((lv, i) => (
+            <Box flexDirection="column">
+              <Text bold>{t.stage(i + 1, lv.length)}</Text>
+              {lv.map(row)}
             </Box>
-          ) : null}
+          ))}
+          {view.later.length ? <Text dimColor>{`${t.laterStage(view.later.length)}: ${view.later.map(n => n.title).join(' · ')}`}</Text> : null}
         </Box>
       )
     }
-    const section = (title: string, nodes: WorkflowNode[]) =>
-      nodes.length === 0 ? null : (
-        <Box flexDirection="column">
-          <Text bold>
-            {title} <Text color={DIM}>{nodes.length}</Text>
-          </Text>
-          {nodes.map(row)}
-        </Box>
-      )
-    const metro = Svg ? metroSvg(map, { lanes: 99, maxWidth: paneRoom, compact: false, lang, wrap: true }) : undefined
-    const latest = done.slice(-3).reverse()
 
+    const T = await themeOf($)
+    const paneW = Math.min(1400, Math.max(300, Math.round(((e.props as { bodyColumns?: number }).bodyColumns ?? 100) * PANE_PX_PER_COL) - 16))
+    const buttonsW = folds.reduce((w, b) => w + tw(b.label) + 44, 0)
+    const meter = paneMeter(map, lang, T, paneW - buttonsW, pending)
+    const stages = paneStages(map, view, { lang, T, width: paneW, doneOpen })
     return (
-      <Box flexDirection="column" gap={1} paddingX={1}>
-        <Box flexDirection="row" gap={1} alignItems="center">
-          {Svg ? <Svg source={progressSvg(map, barW).source} alt={t.progressTip(done.length, total)} width={barW} height={10} /> : null}
-          <Text>
-            {done.length}/{total}
-          </Text>
+      <Box flexDirection="column" paddingX={1}>
+        <Box flexDirection="row" alignItems="center" gap={1}>
+          <Box flexShrink={1} overflow="hidden">
+            <Svg
+              source={meter.source}
+              alt={[t.progressTip(s.done, s.total), pending ? t.unloggedTip : ''].filter(Boolean).join('\n')}
+              width={meter.width}
+              height={meter.height}
+            />
+          </Box>
+          <Box flexGrow={1} />
+          {buttons}
         </Box>
-        {pending ? (
-          <Box flexDirection="row" gap={1} alignItems="center">
-            {Svg ? <Svg source={PENDING_DOT.source} alt="" width={14} height={14} /> : <Text color="warning">●</Text>}
-            <Text color={DIM}>{t.unloggedTip}</Text>
-          </Box>
-        ) : null}
-        {metro && Svg ? <Svg source={metro.source} alt={plainLines(map, lang).join('\n')} width={metro.width} height={metro.height} /> : null}
-        {section(t.secDoing, doing)}
-        {section(t.secNext, upNext)}
-        {done.length ? (
-          <Box flexDirection="column">
-            <Button key="done-toggle" plain label={doneOpen ? `${t.doneCount(done.length)} ▴` : `${t.doneCount(done.length)} ▾`} onPress={() => update($, DONE_OPEN, v => !v)} />
-            {(doneOpen ? done : latest).map(row)}
-          </Box>
-        ) : null}
+        <Box>
+          <Svg source={stages.source} alt={plainLines(map, lang).join('\n')} width={stages.width} height={stages.height} />
+        </Box>
       </Box>
     )
   })
@@ -369,20 +423,13 @@ async function serveTool($: $, e: Record<string, unknown>): Promise<{ deny: stri
   if ('error' in r) return { deny: r.error }
   if (op.op !== 'show') await $.fs.write(await filePath($), `${JSON.stringify(r.map, null, 2)}\n`)
   await update($, MAP, () => r.map)
+  if (op.op !== 'show') await foldAll($)
   if (await read($, PENDING)) await update($, PENDING, () => false)
-  return { result: [r.info, textDiagram(r.map, 60, langOf(r.map))].filter(Boolean).join('\n') }
+  return { result: [r.info, textDiagram(r.map, 60, 'en')].filter(Boolean).join('\n') }
 }
 
 async function toggle($: $) {
   const v = !(await read($, EXPANDED))
   await update($, EXPANDED, () => v)
   await $.store.set('expanded', v)
-}
-
-/** ISO → 本地 MM-DD HH:MM；缺少或無效（含 1970 起點）時回傳空字串，不顯示時間。 */
-function fmtTime(iso: string | undefined): string {
-  const d = new Date(iso ?? '')
-  if (!iso || Number.isNaN(d.getTime()) || d.getTime() <= 86_400_000) return ''
-  const p = (n: number) => String(n).padStart(2, '0')
-  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
 }
