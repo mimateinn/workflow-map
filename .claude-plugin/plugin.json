@@ -1,0 +1,23 @@
+{
+  "name": "workflow-map",
+  "version": "0.1.0",
+  "description": "Live workflow map: a one-line progress strip above the prompt that expands into a compact metro-line view of the current work (parallel branches, dependencies, status), with your mid-plan interjections clearly marked.",
+  "author": {
+    "name": "mimateinn"
+  },
+  "license": "MIT",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "language": {
+      "type": "string",
+      "title": "Language",
+      "description": "Interface language. auto = Traditional Chinese when step titles contain CJK characters, otherwise English.",
+      "default": "auto",
+      "options": [
+        "auto",
+        "zh-Hant",
+        "en"
+      ]
+    }
+  }
+}

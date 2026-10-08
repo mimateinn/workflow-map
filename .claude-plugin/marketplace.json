@@ -1,0 +1,6 @@
+{
+  "name": "workflow-map",
+  "owner": { "name": "mimateinn" },
+  "description": "workflow-map: live dependency diagram of the current work for Claude Code.",
+  "plugins": [{ "name": "workflow-map", "source": "./" }]
+}
