@@ -472,8 +472,10 @@ describe('band', () => {
 
     await ui.press({ key: 'toggle' })
     const all = await ui.findAll({ type: 'Svg' })
-    expect(all.length).toBe(3)
-    const graph = String(all[2]!.props.source)
+    // 標題行兩張 + 卡片圖：已完成小卡（+ 指著時清單的圖示）、各層的卡；沒有收起的步驟 → 沒有幽靈卡
+    expect(all.length).toBe(5)
+    expect(await ui.find({ key: 'peek-later' })).toBeUndefined()
+    const graph = all.slice(2).map(s => String(s.props.source)).join('')
     // 已完成一張卡 + 「寫 API ∥ 畫 UI」同一張卡；整合測試屬較遠的一層（小計劃不收，畫第三張）
     expect((graph.match(/rx='4'/g) ?? []).length).toBe(3)
     const card = graph.split("rx='4'")[2]!
@@ -1236,22 +1238,47 @@ describe('per-session plans', () => {
   })
 })
 
-describe('band later chip', () => {
-  test('"+N later" is a button after the graph; pressing shows the later steps, pressing again hides them', async ($, on) => {
+describe('band ghost card and peek', () => {
+  type El = { type?: string; key?: string; props?: Record<string, unknown>; hover?: Record<string, unknown>; text?: string; children?: El[] }
+  const hiddenChild = (box: El | undefined) => (box?.children ?? []).find(c => c && c.type === 'Box' && c.props?.display === 'none')
+
+  test('hidden future is a dashed ghost card at the end of the line; hovering it lists the hidden steps; no buttons in the graph', async ($, on) => {
     world(on, {})
     await $.session.start(START)
     await $.command.run({ command: 'workflow-demo', args: '', origin: { kind: 'composer' } } as never)
     const ui = await $.ui.mount({ plugin: 'workflow-map', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
     await ui.press({ key: 'toggle' })
-    const chip = await ui.find({ key: 'band-later' })
-    expect([chip?.type, chip?.text]).toEqual(['Button', '+2 later'])
-    expect(await svgText(ui)).not.toContain('Real-app check')
-    await ui.press({ key: 'band-later' })
-    expect(await svgText(ui)).toContain('Real-app check')
-    expect(await svgText(ui)).toContain('Release')
-    expect((await ui.find({ key: 'band-less' }))?.text).toBe('Hide later')
-    await ui.press({ key: 'band-less' })
-    expect(await svgText(ui)).not.toContain('Real-app check')
+    const graph = (await ui.find({ key: 'graph' })) as unknown as El
+    // 一行：已完成小卡、各層的卡、幽靈卡；沒有按鈕
+    expect((graph.children ?? []).filter(Boolean).map(c => c.props?.key)).toEqual(['peek-done', 'graph-main', 'peek-later'])
+    expect(JSON.stringify(graph)).not.toContain('"Button"')
+    const later = (await ui.find({ key: 'peek-later' })) as unknown as El
+    const ghostSvg = String((later.children ?? []).find(c => c?.type === 'Svg')?.props?.source)
+    expect(ghostSvg).toContain("stroke-dasharray='3 2'") // 虛線框
+    expect(ghostSvg).toContain("stroke-dasharray='3 3'") // 虛線連線
+    expect(ghostSvg).toContain('+2 later')
+    // 指著才顯示：display none → hover display flex，向上開；列出收起的步驟
+    const pop = hiddenChild(later)
+    expect([pop?.props?.position, pop?.props?.bottom, pop?.hover?.display]).toEqual(['absolute', 1, 'flex'])
+    expect(JSON.stringify(pop)).toContain('Real-app check')
+    expect(JSON.stringify(pop)).toContain('Release')
+    expect(JSON.stringify(pop)).toContain('waits for')
+    // 左邊已完成小卡：指著列出已完成的步驟（負責人 · 用時）
+    const done = (await ui.find({ key: 'peek-done' })) as unknown as El
+    const donePop = hiddenChild(done)
+    expect(JSON.stringify(donePop)).toContain('Gather needs')
+    expect(JSON.stringify(donePop)).toContain('me · 10m')
+    expect(donePop?.hover?.display).toBe('flex')
+    await ui.unmount()
+  })
+
+  test('terminal: no hover — the hidden steps show as "+N later" text', async ($, on) => {
+    world(on, {})
+    await $.session.start(START)
+    await $.command.run({ command: 'workflow-demo', args: '', origin: { kind: 'composer' } } as never)
+    const ui = await $.ui.mount({ plugin: 'workflow-map', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS })
+    await ui.press({ key: 'toggle' })
+    expect(await ui.find({ type: 'Text', text: /\+\d+ later/ })).toBeDefined()
     await ui.unmount()
   })
 })

@@ -9,7 +9,7 @@
 ## What it does
 
 - **One row above the prompt** — the step that is running, what comes next, and a segmented progress bar (`3/9`).
-- **Expand for the card graph** — GitHub-Actions-style cards: finished work folded into "✓ N done", parallel steps stacked in one card, later steps folded into "+N later".
+- **Expand for the card graph** — GitHub-Actions-style cards: finished work folded into "✓ N done", parallel steps stacked in one card, later steps folded into a dashed "+N later" card at the end of the line. Point at "✓ N done" or "+N later" to peek at the steps inside.
 - **Your interjections are kept** — when you ask for something mid-plan, Claude records it as a violet ◇ step (with the time and your words) before acting on it, so it doesn't get lost.
 - **Full view on demand** — `/workflow` opens stage-by-stage cards, showing what each waiting step is waiting for. Press **Details** on a step to see more: your original words, what it waits for and unblocks, owner, start/finish times and its status history.
 - **Made for several agents** — each step can have an **owner** (Builder, Grok, "me"…), shown as a small tag with the time it has taken. Start a sub-agent with `[wm:<id>]` in its description and its step turns *in progress* on its own, then *done* (or *blocked* if the agent failed). A step in progress with no update for 30 minutes turns amber ("no update").

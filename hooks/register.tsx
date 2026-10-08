@@ -9,7 +9,7 @@ import { detectLang, HELP_TABS, LANGS, looksLikeRequest, resolveLang, STR } from
 import type { Lang } from './i18n'
 import { CAPSULE_CELLS, CAPSULE_CHROME, cells, fitCells, forkPrompt, languageRule, MAX_SUGGESTIONS, MIN_ANSWER_CHARS, parseSuggestions, planSuggestions, ROW_CHROME, sameAs, skillList } from './suggest'
 import type { Suggestion, SuggestView } from './suggest'
-import { amberPic, bandGraph, bandHeader, chevronPic, detailLines, fmtTime, iconPic, miniBar, paneBar, paneCards, paneStatus, PX_PER_COL, slotPic, STAR_W, starPic, THEMES } from './svg'
+import { amberPic, bandGraph, bandHeader, chevronPic, detailLines, fmtTime, iconPic, kindOf, metaOf, miniBar, paneBar, paneCards, paneStatus, PX_PER_COL, slotPic, STAR_W, starPic, THEMES } from './svg'
 import type { Clock, Kind } from './svg'
 
 const TOOL = 'mcp__workflow-map__workflow_map'
@@ -78,10 +78,12 @@ const FUTURE_OPEN = atom({ plugin: 'workflow-map', key: 'futureOpen' } as const,
 const HISTORY_OPEN = atom({ plugin: 'workflow-map', key: 'historyOpen' } as const, false)
 /** 全圖面板展開詳情的步驟（一次只開一個；'' = 無） */
 const SELECTED = atom({ plugin: 'workflow-map', key: 'selected' } as const, '')
-/** 輸入框上方的卡片圖：是否顯示全部步驟（含稍後的層） */
-const BAND_ALL = atom({ plugin: 'workflow-map', key: 'bandAll' } as const, false)
-/** 卡片圖全部顯示時最多幾行卡 */
-const BAND_MAX_ROWS = 6
+/**
+ * 卡片圖兩端小卡指著時彈出的清單：最多幾行；底色要不透明（下面是對話內容），types 沒有「浮動面」的主題色，
+ * 所以按深淺主題選色（接近 app 自己卡片的顏色）。
+ */
+const PEEK_MAX = 6
+const PEEK_FILL = { dark: '#2b2b2b', light: '#f3f3f3' } as const
 /** 全圖面板最上面的說明卡是否打開 */
 const HELP_OPEN = atom({ plugin: 'workflow-map', key: 'helpOpen' } as const, false)
 /** 全圖面板：專案總覽、正在唯讀檢視的另一個專案 */
@@ -715,7 +717,8 @@ export const register: Register = (on, options) => {
 
     let planRows: RenderChildren = null
     if (showPlan && !Svg) {
-      const shown = expanded ? plainLines(map, lang).slice(0, 6) : []
+      const all = plainLines(map, lang)
+      const shown = expanded ? all.slice(0, 6) : []
       planRows = [
         <Box key="title" flexDirection="row" gap={1}>
           <Box flexShrink={1} flexGrow={1}>
@@ -725,6 +728,7 @@ export const register: Register = (on, options) => {
           {controls}
         </Box>,
         ...shown.map(line => <Text wrap="truncate-end">{line}</Text>),
+        expanded && all.length > shown.length ? <Text dimColor>{t.laterCard(all.length - shown.length)}</Text> : null,
       ]
     } else if (showPlan && Svg) {
       const view = stageView(map, { freshSince: await read($, TURN_AT) })
@@ -733,36 +737,41 @@ export const register: Register = (on, options) => {
       const clock = await clockOf($)
       const etaM = etaMin(map, clock.now)
       const head = bandHeader(map, view, lang, T, avail, pending, clock, etaM === undefined ? '' : `≈ ${t.durShort(etaM)}`)
-      const showAll = await read($, BAND_ALL)
-      const graph = expanded
-        ? bandGraph(map, showAll ? stageView(map, { freshSince: await read($, TURN_AT), expandFuture: true }) : view, lang, T, avail - 80, clock, {
-            all: showAll,
-            maxRows: BAND_MAX_ROWS,
-          })
-        : undefined
-      // 「+N 稍後」：圖後的 app 文字按鈕（圖裏的字按不到）；全部顯示時是「收起稍後」，再多的仍有「+N … 全圖」
-      const chips = graph
-        ? [
-            ...(showAll ? [<Button key="band-less" {...ICON_BTN} label={t.hideLater} onPress={() => update($, BAND_ALL, () => false)} />] : []),
-            ...(graph.hidden > 0
-              ? [
-                  showAll ? (
-                    <Button
-                      key="band-more"
-                      {...ICON_BTN}
-                      label={t.moreInFull(graph.hidden)}
-                      onPress={async () => {
-                        await update($, FUTURE_OPEN, () => true)
-                        await openPane($, lang)
-                      }}
-                    />
-                  ) : (
-                    <Button key="band-later" {...ICON_BTN} label={t.laterCard(graph.hidden)} onPress={() => update($, BAND_ALL, () => true)} />
-                  ),
-                ]
-              : []),
-          ]
-        : []
+      const graph = expanded ? bandGraph(map, view, lang, T, avail + 56, clock) : undefined
+      // 指著兩端小卡時的清單（無 hook：有 key 的 Box 是 hover 範圍，裏面藏一個沒有 key、display:none 的 Box，hover 時 display:flex）。
+      // position:absolute、bottom={1}：向上開（下面是輸入框），底邊貼住小卡頂；已完成的由左邊對齊、稍後的由右邊對齊（在線的盡頭，向左開不出界）
+      const ready = readyIds(map.nodes)
+      const byId = new Map(map.nodes.map(n => [n.id, n]))
+      const peekFill = PEEK_FILL[(await read($, LIGHT)) ? 'light' : 'dark']
+      const peek = (rows: { n: (typeof map.nodes)[number]; meta: string }[], more: number, side: 'left' | 'right') => (
+        <Box
+          position="absolute"
+          bottom={1}
+          {...(side === 'left' ? { left: 0 } : { right: 0 })}
+          display="none"
+          hover={{ display: 'flex' }}
+          flexDirection="column"
+          paddingX={SPACE.PAD}
+          borderStyle="round"
+          borderColor={CARD_EDGE}
+          backgroundColor={peekFill}
+        >
+          {rows.map(({ n, meta }) => (
+            <Box flexDirection="row" alignItems="center" gap={SPACE.GAP}>
+              <Svg source={iconPic(kindOf(n, ready, clock), !!n.inserted, T).source} alt={t.status[n.status]} width={ICON_COL} height={ICON_COL} />
+              <Text>{fitCells(n.title, 32)}</Text>
+              {meta ? <Text dimColor>{fitCells(meta, 36)}</Text> : null}
+            </Box>
+          ))}
+          {more > 0 ? <Text dimColor>{t.peekMore(more)}</Text> : null}
+        </Box>
+      )
+      const waitsOf = (n: (typeof map.nodes)[number]) => {
+        const w = n.deps.map(d => byId.get(d)).filter(d => d && d.status !== 'done' && d.status !== 'dropped')
+        return w.length ? `← ${t.waitShort(w.map(d => d!.title).join(t.list))}` : ''
+      }
+      const laterRows = (graph?.hiddenSteps ?? []).map(n => ({ n, meta: waitsOf(n) }))
+      const doneRows = view.done.map(n => ({ n, meta: metaOf(n, lang, clock, true) }))
       const s = stats(map)
       planRows = [
         <Box key="title" flexDirection="row" alignItems="center" gap={SPACE.GAP}>
@@ -782,9 +791,23 @@ export const register: Register = (on, options) => {
           {controls}
         </Box>,
         graph ? (
-          <Box key="graph" flexDirection="row" alignItems="flex-start" gap={SPACE.GAP}>
-            <Svg source={graph.source} alt={plainLines(map, lang).join('\n')} width={graph.width} height={graph.height} />
-            {chips}
+          // 一行三張圖，中間沒有空隙（線接得上）：[已完成小卡]（指著：已完成清單）[各層的卡][稍後幽靈卡]（指著：稍後清單）
+          <Box key="graph" flexDirection="row" alignItems="flex-start" gap={0}>
+            {graph.done ? (
+              <Box key="peek-done" flexShrink={0}>
+                <Svg source={graph.done.source} alt={t.doneCard(view.done.length)} width={graph.done.width} height={graph.done.height} />
+                {peek(doneRows.slice(-PEEK_MAX), Math.max(0, doneRows.length - PEEK_MAX), 'left')}
+              </Box>
+            ) : null}
+            <Box key="graph-main" flexShrink={0}>
+              <Svg source={graph.main.source} alt={plainLines(map, lang).join('\n')} width={graph.main.width} height={graph.main.height} />
+            </Box>
+            {graph.ghost ? (
+              <Box key="peek-later" flexShrink={0}>
+                <Svg source={graph.ghost.source} alt={t.laterCard(graph.hiddenSteps.length)} width={graph.ghost.width} height={graph.ghost.height} />
+                {peek(laterRows.slice(0, PEEK_MAX), Math.max(0, laterRows.length - PEEK_MAX), 'right')}
+              </Box>
+            ) : null}
           </Box>
         ) : null,
       ]

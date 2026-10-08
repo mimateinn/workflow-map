@@ -114,7 +114,6 @@ export type Strings = {
   showDone: string
   hideDone: string
   showLater: string
-  hideLater: string
   expandTip: string
   collapseTip: string
   openTip: string
@@ -167,9 +166,10 @@ export type Strings = {
   undoBtn: string
   undone: (what: string) => string
   nothingToUndo: string
-  /** 說明卡第一行的「語言」；卡片圖放不下時「+N … 全圖」 */
+  /** 說明卡第一行的「語言」 */
   languageLabel: string
-  moreInFull: (n: number) => string
+  /** 彈出清單最後一行：還有幾項（全圖看） */
+  peekMore: (n: number) => string
   /** 每個 session 的計劃：清單、加入、離開 */
   plans: string
   hidePlans: string
@@ -237,7 +237,6 @@ const ZH_HANT: Strings = {
   showDone: '顯示已完成',
   hideDone: '收起已完成',
   showLater: '顯示稍後',
-  hideLater: '收起稍後',
   expandTip: '展開',
   collapseTip: '收起',
   openTip: '全圖',
@@ -309,7 +308,7 @@ const ZH_HANT: Strings = {
   left: '已離開計劃',
   planNotFound: r => `找不到計劃：${r}`,
   languageLabel: '語言',
-  moreInFull: n => `+${n} … 全圖`,
+  peekMore: n => `… 還有 ${n} 項 · 全圖`,
   continueLead: '繼續做：',
   fillFail: '未能放入輸入框',
   history: '歷史紀錄',
@@ -357,7 +356,6 @@ const EN: Strings = {
   showDone: 'Show done',
   hideDone: 'Hide done',
   showLater: 'Show later',
-  hideLater: 'Hide later',
   expandTip: 'Expand',
   collapseTip: 'Collapse',
   openTip: 'Full view',
@@ -429,7 +427,7 @@ const EN: Strings = {
   left: 'Left the plan',
   planNotFound: r => `No plan found: ${r}`,
   languageLabel: 'Language',
-  moreInFull: n => `+${n} … Full view`,
+  peekMore: n => `… +${n} more · Full view`,
   continueLead: 'Continue: ',
   fillFail: 'Could not fill the prompt box',
   history: 'History',
@@ -478,7 +476,6 @@ const JA: Strings = {
   showDone: '完了を表示',
   hideDone: '完了を隠す',
   showLater: '後でを表示',
-  hideLater: '後でを隠す',
   expandTip: '開く',
   collapseTip: '閉じる',
   openTip: '全体',
@@ -550,7 +547,7 @@ const JA: Strings = {
   left: '計画から離れました',
   planNotFound: r => `計画が見つかりません：${r}`,
   languageLabel: '言語',
-  moreInFull: n => `+${n} … 全体`,
+  peekMore: n => `… 他 ${n} 件 · 全体`,
   continueLead: '続けて：',
   fillFail: '入力欄に入れられませんでした',
   history: '履歴',
@@ -595,7 +592,6 @@ const KO: Strings = {
   showDone: '완료 보기',
   hideDone: '완료 숨기기',
   showLater: '나중 보기',
-  hideLater: '나중 숨기기',
   expandTip: '펼치기',
   collapseTip: '접기',
   openTip: '전체',
@@ -667,7 +663,7 @@ const KO: Strings = {
   left: '계획에서 나갔습니다',
   planNotFound: r => `계획을 찾을 수 없습니다: ${r}`,
   languageLabel: '언어',
-  moreInFull: n => `+${n} … 전체`,
+  peekMore: n => `… ${n}개 더 · 전체`,
   continueLead: '계속: ',
   fillFail: '입력창에 넣지 못했습니다',
   history: '기록',
@@ -712,7 +708,6 @@ const ES: Strings = {
   showDone: 'Ver hechos',
   hideDone: 'Ocultar hechos',
   showLater: 'Ver después',
-  hideLater: 'Ocultar después',
   expandTip: 'Expandir',
   collapseTip: 'Contraer',
   openTip: 'Vista completa',
@@ -782,7 +777,7 @@ const ES: Strings = {
   left: 'Saliste del plan',
   planNotFound: r => `No se encontró el plan: ${r}`,
   languageLabel: 'Idioma',
-  moreInFull: n => `+${n} … Vista completa`,
+  peekMore: n => `… ${n} más · Vista completa`,
   continueLead: 'Continúa: ',
   fillFail: 'No se pudo rellenar el cuadro de texto',
   history: 'Historial',
@@ -827,7 +822,6 @@ const FR: Strings = {
   showDone: 'Voir les faites',
   hideDone: 'Masquer les faites',
   showLater: 'Voir la suite',
-  hideLater: 'Masquer la suite',
   expandTip: 'Déplier',
   collapseTip: 'Replier',
   openTip: 'Vue complète',
@@ -897,7 +891,7 @@ const FR: Strings = {
   left: 'Plan quitté',
   planNotFound: r => `Plan introuvable : ${r}`,
   languageLabel: 'Langue',
-  moreInFull: n => `+${n} … Vue complète`,
+  peekMore: n => `… ${n} de plus · Vue complète`,
   continueLead: 'Continue : ',
   fillFail: 'Impossible de remplir la zone de saisie',
   history: 'Historique',
@@ -942,7 +936,6 @@ const DE: Strings = {
   showDone: 'Erledigte zeigen',
   hideDone: 'Erledigte ausblenden',
   showLater: 'Später zeigen',
-  hideLater: 'Später ausblenden',
   expandTip: 'Ausklappen',
   collapseTip: 'Einklappen',
   openTip: 'Gesamtansicht',
@@ -1013,7 +1006,7 @@ const DE: Strings = {
   left: 'Plan verlassen',
   planNotFound: r => `Kein Plan gefunden: ${r}`,
   languageLabel: 'Sprache',
-  moreInFull: n => `+${n} … Gesamtansicht`,
+  peekMore: n => `… ${n} weitere · Gesamtansicht`,
   continueLead: 'Weiter: ',
   fillFail: 'Eingabefeld konnte nicht gefüllt werden',
   history: 'Verlauf',

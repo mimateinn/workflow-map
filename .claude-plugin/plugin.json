@@ -1,6 +1,6 @@
 {
   "name": "workflow-map",
-  "version": "0.3.1",
+  "version": "0.3.3",
   "description": "Live workflow map: one row above the prompt (what is running, what is next, segmented progress) that expands into a card graph of parallel steps, plus a full stage-by-stage view, with your mid-plan interjections clearly marked, owners and timing per step, sub-agent sync and plan history.",
   "author": {
     "name": "mimateinn"

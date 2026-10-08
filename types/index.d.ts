@@ -79,8 +79,6 @@ declare module 'claude-code' {
       helpLang: string
       /** 下一句建議的狀態（併入自 next-steps） */
       suggest: SuggestView
-      /** 輸入框上方的卡片圖是否顯示全部步驟 */
-      bandAll: boolean
       /** 全圖面板最上面的說明卡是否打開 */
       helpOpen: boolean
       /** 全圖面板展開詳情的步驟 id（'' = 無） */

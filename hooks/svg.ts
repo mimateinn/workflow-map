@@ -283,83 +283,112 @@ function card(rows: CardRow[], hot: boolean): Card {
 }
 
 /**
- * 卡片圖：[✓ 9 已完成] — [同層並行步驟一張卡] — …。卡頂對齊，連接點在第一行中線，線都是直的、不會交叉。
- * 放不下的層不畫，數目回傳為 hidden（介面在圖後畫一個可按的「+N 稍後」按鈕）。
- * all = 全部顯示：每一層都畫，放不下就換到下一行（最多 maxRows 行；再多的仍算進 hidden）。
+ * 卡片圖，分成三張圖（同一行，中間沒有空隙，線接得上）：
+ *   [✓ 5 已完成 ——]   [同層並行步驟一張卡 — … —●]   [- - +2 稍後（虛線幽靈卡）]
+ * 左右兩張各自放在有 key 的 Box 內，指著時彈出清單（已完成／稍後的步驟）。
+ * 中間的卡頂對齊，連接點在第一行中線，線都是直的。放不下的層算進「稍後」。
  */
-export function bandGraph(
-  map: WorkflowMap,
-  view: StageView,
-  lang: Lang,
-  T: Theme,
-  maxW: number,
-  clk: Clock = NO_CLOCK,
-  o: { all?: boolean; maxRows?: number } = {},
-): Pic & { hidden: number } {
+export type BandGraph = {
+  /** 「✓ N 已完成」小卡＋接到下一張卡的線（沒有已完成步驟時 undefined） */
+  done?: Pic
+  main: Pic
+  /** 「+N 稍後」虛線幽靈卡＋虛線（沒有收起的步驟時 undefined） */
+  ghost?: Pic
+  /** 收起的步驟（計劃次序），給彈出清單用 */
+  hiddenSteps: WorkflowNode[]
+  /** 中間那張圖畫了幾張卡、幾條卡與卡之間的線 */
+  cards: number
+  edges: number
+}
+
+export function bandGraph(map: WorkflowMap, view: StageView, lang: Lang, T: Theme, maxW: number, clk: Clock = NO_CLOCK): BandGraph {
   const t = STR[lang]
   const ready = readyIds(map.nodes)
-  const maxRows = o.all ? (o.maxRows ?? 6) : 1
-  const rows: Card[][] = [[]]
-  const rowW = () => rows[rows.length - 1]!.reduce((w, c, i) => w + (i ? CARD_GAP : 0) + c.w, 0)
-  let hiddenSteps = [...view.later]
-  let stop = false
-  const place = (c: Card, steps: readonly WorkflowNode[]) => {
-    if (stop) return void hiddenSteps.push(...steps)
-    const row = rows[rows.length - 1]!
-    if (row.length && BAND_INSET + rowW() + CARD_GAP + c.w > maxW) {
-      if (rows.length >= maxRows) {
-        stop = true
-        return void hiddenSteps.push(...steps)
-      }
-      rows.push([c])
-      return
-    }
-    row.push(c)
+  const portY = 0.5 + 1 + CARD_ROW / 2
+  const TOP = 4 // 與標題行之間 4px
+  const line = (hot: boolean, dashed = false) =>
+    `${hot ? `stroke='${T.run}'` : `stroke='${T.ink}' stroke-opacity='.22'`} stroke-width='1.5'${dashed ? " stroke-dasharray='3 3'" : ''}`
+  const dot = (cx: number, hot: boolean) => `<circle cx='${r1(cx)}' cy='${r1(portY)}' r='2.5' ${hot ? `fill='${T.run}'` : `fill='${T.ink}' fill-opacity='.3'`}/>`
+  const drawCard = (c: Card, x: number, parts: string[], ghost = false) => {
+    const h = 2 + c.rows.length * CARD_ROW
+    parts.push(
+      ghost
+        ? `<rect x='${r1(x + 0.5)}' y='0.5' width='${r1(c.w - 1)}' height='${h}' rx='4' fill='${T.ink}' fill-opacity='.035' stroke='${T.ink}' stroke-opacity='.35' stroke-dasharray='3 2'/>`
+        : // 卡面：比四周略亮的填色，沒有外框（與 app 自己的卡片一致）
+          `<rect x='${r1(x + 0.5)}' y='0.5' width='${r1(c.w - 1)}' height='${h}' rx='4' fill='${T.ink}' fill-opacity='.07'/>`,
+    )
+    c.rows.forEach((r, j) => {
+      const cy = 0.5 + 1 + j * CARD_ROW + CARD_ROW / 2
+      if (r.k) parts.push(icon(r.k, !!r.ins, x + ICON_X, cy, T))
+      // textLength 只在後面還有字時才用（否則估算誤差會把字距拉開）
+      parts.push(text(x + (r.k ? LABEL_X : 10), cy + 4, r.label, r.cls ?? '', { fixed: !!r.meta }))
+      if (r.meta) parts.push(text(x + (r.k ? LABEL_X : 10) + tw(r.label) + 6, cy + 4, r.meta, 'm', { fixed: true }))
+    })
+    return h + 1
   }
-  if (view.done.length) place(card([{ k: 'done', label: t.doneCard(view.done.length) }], false), [])
-  view.levels.forEach(lv => {
+  const pic = (w: number, h: number, parts: string[], x0 = 0) =>
+    doc(w, h + TOP, T, `<g transform='translate(${x0},${TOP})'>${parts.join('')}</g>`)
+
+  // 中間各層的卡：放得下多少就畫多少（左右兩張小卡的位先留起）
+  const levelCards = view.levels.map(lv => {
     const shown = lv.length > 3 ? lv.slice(0, 2) : lv
     const cr: CardRow[] = shown.map(n => ({ k: kindOf(n, ready, clk), ins: !!n.inserted, label: n.title, meta: metaOf(n, lang, clk, true) }))
     if (lv.length > 3) cr.push({ label: t.moreRows(lv.length - 2), cls: 'd' })
-    place(card(cr, lv.some(n => n.status === 'doing')), lv)
+    return { c: card(cr, lv.some(n => n.status === 'doing')), steps: lv }
   })
-  hiddenSteps = hiddenSteps.filter((n, i, a) => a.indexOf(n) === i)
-  // 卡先畫，線與連接點後畫（點蓋在卡邊上）；只連同一行之內的卡
+  const doneCard = view.done.length ? card([{ k: 'done', label: t.doneCard(view.done.length) }], false) : undefined
+  const doneW = doneCard ? doneCard.w + CARD_GAP : 0
+  const ghostReserve = (n: number) => CARD_GAP + 20 + tw(t.laterCard(n)) + 20
+  const placed: Card[] = []
+  const hiddenSteps: WorkflowNode[] = []
+  let used = BAND_INSET + doneW
+  levelCards.forEach(({ c, steps }, i) => {
+    const rest = levelCards.slice(i + 1).reduce((n, x) => n + x.steps.length, 0) + view.later.length
+    const fits = used + (placed.length ? CARD_GAP : 0) + c.w + (rest ? ghostReserve(rest + steps.length) : 0) <= maxW
+    if (hiddenSteps.length || (placed.length && !fits)) return void hiddenSteps.push(...steps)
+    placed.push(c)
+    used += (placed.length > 1 ? CARD_GAP : 0) + c.w
+  })
+  hiddenSteps.push(...view.later)
+  const hidden = hiddenSteps.filter((n, i, a) => a.indexOf(n) === i)
+
+  // 左：已完成小卡 + 接到第一張卡的線
+  let done: Pic | undefined
+  if (doneCard) {
+    const parts: string[] = []
+    const h = drawCard(doneCard, 0, parts)
+    const hot = placed[0]?.hot ?? false
+    parts.push(`<path d='M${r1(doneCard.w)},${r1(portY)} H${r1(doneCard.w + CARD_GAP)}' ${line(hot)}/>`, dot(doneCard.w, hot), dot(doneCard.w + CARD_GAP - 2.5, hot))
+    done = pic(BAND_INSET + doneCard.w + CARD_GAP, h, parts, BAND_INSET)
+  }
+  // 中：各層的卡與卡之間的線
   const parts: string[] = []
   const wires: string[] = []
-  let y0 = 0
-  let width = 0
-  for (const row of rows) {
-    if (!row.length) continue
-    const portY = y0 + 0.5 + 1 + CARD_ROW / 2
-    const dot = (cx: number, hot: boolean) =>
-      `<circle cx='${r1(cx)}' cy='${r1(portY)}' r='2.5' ${hot ? `fill='${T.run}'` : `fill='${T.ink}' fill-opacity='.3'`}/>`
-    let x = 0
-    let rowH = 0
-    row.forEach((c, i) => {
-      if (i > 0) {
-        const x1 = x - CARD_GAP
-        const stroke = c.hot ? `stroke='${T.run}'` : `stroke='${T.ink}' stroke-opacity='.22'`
-        wires.push(`<path d='M${r1(x1)},${r1(portY)} H${r1(x)}' ${stroke} stroke-width='1.5'/>`, dot(x1, c.hot), dot(x, c.hot))
-      }
-      const h = 2 + c.rows.length * CARD_ROW
-      rowH = Math.max(rowH, h + 1)
-      // 卡面：比四周略亮的填色，沒有外框（與 app 自己的卡片一致）
-      parts.push(`<rect x='${r1(x + 0.5)}' y='${r1(y0 + 0.5)}' width='${r1(c.w - 1)}' height='${h}' rx='4' fill='${T.ink}' fill-opacity='.07'/>`)
-      c.rows.forEach((r, j) => {
-        const cy = y0 + 0.5 + 1 + j * CARD_ROW + CARD_ROW / 2
-        if (r.k) parts.push(icon(r.k, !!r.ins, x + ICON_X, cy, T))
-        // textLength 只在後面還有字時才用（否則估算誤差會把字距拉開）
-        parts.push(text(x + (r.k ? LABEL_X : 10), cy + 4, r.label, r.cls ?? '', { fixed: !!r.meta }))
-        if (r.meta) parts.push(text(x + (r.k ? LABEL_X : 10) + tw(r.label) + 6, cy + 4, r.meta, 'm', { fixed: true }))
-      })
-      x += c.w + CARD_GAP
-    })
-    width = Math.max(width, x - CARD_GAP)
-    y0 += rowH + 8
+  let x = doneCard ? 0 : BAND_INSET
+  let h = 0
+  let edges = 0
+  placed.forEach((c, i) => {
+    if (i > 0) {
+      const x1 = x - CARD_GAP
+      wires.push(`<path d='M${r1(x1)},${r1(portY)} H${r1(x)}' ${line(c.hot)}/>`, dot(x1, c.hot), dot(x, c.hot))
+      edges++
+    }
+    h = Math.max(h, drawCard(c, x, parts))
+    x += c.w + CARD_GAP
+  })
+  const end = Math.max(0, x - CARD_GAP)
+  if (hidden.length) wires.push(dot(end, false))
+  const main = pic(end + (hidden.length ? 3 : 1), h, [...parts, ...wires])
+  // 右：虛線 + 「+N 稍後」幽靈卡
+  let ghost: Pic | undefined
+  if (hidden.length) {
+    const ins = hidden.some(n => n.inserted)
+    const gc = card([{ k: ins ? 'todo' : undefined, ins, label: t.laterCard(hidden.length), cls: 'd' }], false)
+    const gp: string[] = [`<path d='M0,${r1(portY)} H${r1(CARD_GAP - 3)}' ${line(false, true)}/>`]
+    const gh = drawCard(gc, CARD_GAP - 3, gp, true)
+    ghost = pic(CARD_GAP - 3 + gc.w + 1, gh, gp)
   }
-  // 與標題行之間留 4px
-  return { ...doc(BAND_INSET + width + 1, y0 - 8 + 4, T, `<g transform='translate(${BAND_INSET},4)'>${parts.join('')}${wires.join('')}</g>`), hidden: hiddenSteps.length }
+  return { done, main, ghost, hiddenSteps: hidden, cards: placed.length, edges }
 }
 
 // ---------------- 全圖：GitLab 式階段卡（由上而下） ----------------
