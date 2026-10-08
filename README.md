@@ -2,9 +2,11 @@
 
 **See what your AI is doing — and what's next.** A live plan for Claude Code, right above your prompt.
 
-![workflow-map intro](docs/intro.gif)
+<img src="docs/intro.gif" width="800" alt="workflow-map: the live plan above the prompt in the Claude Code desktop app, then the same plan drawn as text in the terminal">
 
-▶ [Watch the intro in full quality (MP4, 31 s)](docs/intro.mp4)
+▶ [Watch the full intro (MP4, 30 s)](docs/intro.mp4)
+
+<sub>Desktop shots are the plugin's own drawing code; the terminal shots are real Claude Code CLI captures, with the plan updates written to the plan file by a script (the model was not called). The install confirmation at the end is a mock of the CLI's success line, not a captured install.</sub>
 
 ## What it does
 

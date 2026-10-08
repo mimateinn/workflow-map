@@ -1,9 +1,10 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
+import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import { applyOp, columns, DONE_ID, elapsedMin, emptyMap, etaMin, exportMarkdown, findCycle, focusedMap, focusSet, isStale, mergeMaps, migrate, MORE_ID, plainLines, readyIds, stageView, textDiagram } from '../hooks/graph'
 import { detectLang, looksLikeRequest, resolveLang } from '../hooks/i18n'
-import { THEMES } from '../hooks/svg'
+import { metaOf, THEMES } from '../hooks/svg'
 import { demoMap } from '../hooks/demo'
 import type { WorkflowMap } from '../types/index'
 
@@ -1569,5 +1570,87 @@ describe('terminal (CLI)', () => {
     expect(texts.find(x => x.text === 'Follow the system light/dark' || /Follow the system/.test(x.text))?.props.color).toBe('merged')
     expect(await ui.findAll({ type: 'Svg' })).toEqual([])
     await ui.unmount()
+  })
+})
+
+describe('pane rows never wrap', () => {
+  type El = { type?: string; key?: string; text?: string; props: Record<string, unknown>; children?: (El | string | null)[] }
+  const LONG = '把卡片圖的連線改成真正的直角走線並且處理換行時的轉角與箭頭' // 30 個字
+  const kids = (e: El | undefined) => (e?.children ?? []).filter((c): c is El => !!c && typeof c === 'object')
+  const all = (e: El | undefined): El[] => (e ? [e, ...kids(e).flatMap(all)] : [])
+  const txt = (e: El | string | null | undefined): string => (typeof e === 'string' ? e : !e ? '' : (e.children ?? []).map(txt).join(''))
+  const lineOf = (row: El | undefined, key: string) => kids(row).find(c => c.props?.key === key || c.key === key)
+  // 計劃：一步做了 1 小時 34 分、負責人「介面設計師」、超過 30 分鐘沒更新（久未更新）
+  // 計劃檔直接寫好（開始於 94 分鐘前；不用把時鐘推前 94 分鐘，否則每 3 秒的計時器要跑上千次）
+  const setup = async ($: Engine, on: On) => {
+    const ago = new Date(Date.parse(NOW) - 94 * 60_000).toISOString()
+    const plan = {
+      schemaVersion: 2,
+      version: 1,
+      planId: 'p1',
+      updatedAt: ago,
+      nodes: [
+        { id: 'a', title: LONG, status: 'doing', owner: '介面設計師', deps: [], startedAt: ago, updatedAt: ago },
+        { id: 'b', title: '截圖', status: 'todo', owner: 'Grok', deps: ['a'], updatedAt: ago },
+      ],
+    }
+    const w = world(on, { [`${PLANS}p1.json`]: JSON.stringify(plan) }, BIND('p1'))
+    await $.session.start(START)
+    return w
+  }
+  const mountPane = ($: Engine, surface: 'desktop' | 'terminal', cols: number) =>
+    $.ui.mount({ plugin: 'workflow-map', surface, component: 'Pane', requestId: 'workflow-map', props: { title: 'x', isFocused: false, bodyColumns: cols } as never })
+
+  for (const surface of ['desktop', 'terminal'] as const)
+    test(`${surface}, 60 columns: only the title shrinks (ellipsis); owner · time, status and Details never wrap and stay on the row`, async ($, on) => {
+      await setup($, on)
+      const ui = await mountPane($, surface, 60)
+      const row = (await ui.find({ key: 'row:a' })) as unknown as El
+      const main = lineOf(row, 'main')
+      // 第一行：圖示、標題（可縮）、空白、負責人 · 用時、狀態字、詳情（三樣都不縮）
+      const parts = kids(main).map(c => [c.props.key ?? c.key ?? c.type, c.props.flexShrink])
+      expect(parts.slice(1)).toEqual([
+        ['title', 1],
+        ['Box', undefined], // 空白（撐開）
+        ['info', 0],
+        ['status', 0],
+        ['detail-btn', 0],
+      ])
+      expect(lineOf(main, 'title')?.props.minWidth).toBe(0)
+      const texts = all(row).filter(e => e.type === 'Text' && e.props.wrap !== undefined)
+      expect(all(row).filter(e => e.type === 'Text').every(e => e.props.wrap === 'truncate-end' || /^[◉◇✓○! ]$/.test(txt(e)))).toBe(true)
+      expect(texts.map(txt)).toEqual([LONG, '介面設計師 · 1時34分', '久未更新'])
+      expect(JSON.stringify(lineOf(main, 'detail-btn'))).toContain('詳情')
+      expect(lineOf(row, 'meta')).toBeUndefined()
+      await ui.unmount()
+    })
+
+  test('narrow pane: owner · time and status move to a second dim line; Details stays on the first', async ($, on) => {
+    await setup($, on)
+    const ui = await mountPane($, 'desktop', 44)
+    const row = (await ui.find({ key: 'row:a' })) as unknown as El
+    const main = lineOf(row, 'main')
+    expect(kids(main).map(c => c.props.key ?? c.key ?? c.type).slice(1)).toEqual(['title', 'Box', 'detail-btn'])
+    const meta = lineOf(row, 'meta')
+    expect(kids(meta).map(c => [c.props.key, c.props.flexShrink]).slice(1)).toEqual([
+      ['info', 0],
+      ['status', 0],
+    ])
+    expect(all(meta).filter(e => e.type === 'Text' && e.props.wrap === 'truncate-end').map(e => [txt(e), e.props.dimColor ?? false, e.props.color ?? ''])).toEqual([
+      ['介面設計師 · 1時34分', true, ''],
+      ['久未更新', false, 'warning'],
+    ])
+    await ui.unmount()
+  })
+
+  test('compact time in every language; owner cut to 10 cells', () => {
+    const n = { id: 'a', title: 'x', status: 'doing' as const, deps: [], owner: '特效設計師兼動畫指導', startedAt: '2026-10-08T10:00:00.000Z' }
+    const at = (min: number) => ({ now: Date.parse('2026-10-08T10:00:00.000Z') + min * 60_000, staleMin: 0 })
+    expect(metaOf(n, 'zh-Hant', at(94))).toBe('特效設計… · 1時34分')
+    expect(metaOf({ ...n, owner: 'Grok' }, 'en', at(94))).toBe('Grok · 1h34m')
+    expect(metaOf({ ...n, owner: 'Grok' }, 'ja', at(94))).toBe('Grok · 1時34分')
+    expect(metaOf({ ...n, owner: 'Grok' }, 'ko', at(94))).toBe('Grok · 1h34m')
+    expect(metaOf({ ...n, owner: 'Grok' }, 'zh-Hant', at(25))).toBe('Grok · 25分')
+    expect(metaOf({ ...n, owner: 'Grok' }, 'en', at(25))).toBe('Grok · 25m')
   })
 })

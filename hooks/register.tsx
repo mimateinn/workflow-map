@@ -32,6 +32,8 @@ const SPACE = { PAD: 1, GAP: 1 } as const
 const PANE_INSET = 1
 const CARD_GAP = 0.5
 const ICON_COL = 20
+/** 卡內一行：標題至少要有這麼多格，否則「負責人 · 用時」與狀態字移到第二行 */
+const TITLE_MIN = 12
 /**
  * 按鈕跟 app 自己的設計：types 只有一種原生圖示按鈕（role="dismiss" = 原生關閉 ✕），沒有展開／收起／開啟／說明等
  * 原生圖示，也沒有圖示元素。所以：關閉用 role="dismiss"；其餘用 app 的文字按鈕（plain、淡色；指著時 app 自己的反白），
@@ -924,7 +926,7 @@ export const register: Register = (on, options) => {
         return w.length ? `← ${t.waitShort(w.map(d => d!.title).join(t.list))}` : ''
       }
       const laterRows = (graph?.hiddenSteps ?? []).map(n => ({ n, meta: waitsOf(n) }))
-      const doneRows = view.done.map(n => ({ n, meta: metaOf(n, lang, clock, true) }))
+      const doneRows = view.done.map(n => ({ n, meta: metaOf(n, lang, clock) }))
       const s = stats(map)
       planRows = [
         <Box key="title" flexDirection="row" alignItems="center" gap={SPACE.GAP}>
@@ -1124,39 +1126,62 @@ export const register: Register = (on, options) => {
       </Box>
     )
     const status = [paneStatus(map, lang), pending ? t.unlogged : ''].filter(Boolean).join(' · ')
+    // 一行裏面甚麼都不換行：只有標題會縮（省略號，完整標題在「詳情」）；負責人 · 用時、狀態字、詳情都不縮。
+    // 窄面板：固定的部分放進去後標題不夠 TITLE_MIN 格 → 負責人 · 用時、狀態字移到標題下面一行（淡色），詳情留在第一行。
+    const fixed = (key: string, text: string, color?: string, dim?: boolean) => (
+      <Box key={key} flexShrink={0}>
+        <Text color={color} dimColor={dim} wrap="truncate-end">
+          {text}
+        </Text>
+      </Box>
+    )
+    const shrink = (key: string, el: RenderChildren) => (
+      <Box key={key} flexShrink={1} minWidth={0} overflow="hidden">
+        {el}
+      </Box>
+    )
+    // 卡內一行左右的固定闊度（格）：面板內距 + 框 + 卡內距 + 圖示欄 + 兩個間距
+    const rowChrome = PANE_INSET + 2 + 2 * SPACE.PAD + (Svg ? 3 : 1) + 2 * SPACE.GAP
+    const titleRoom = (r: (typeof cards)[number]['rows'][number], detail: string) =>
+      cols - rowChrome - (r.info ? cells(r.info) + SPACE.GAP : 0) - (r.status ? cells(r.status) + SPACE.GAP : 0) - (cells(detail) + 2)
     // 一張階段卡：卡頭（已完成段不用，段標題已說了）＋ 各步，步與步之間 app 的分隔線
     const stageCard = (c: (typeof cards)[number], bare: boolean) =>
       card(c.key, [
-        bare ? null : line('head', iconCol(undefined, false, ''), <Text bold wrap="truncate-end">{c.head}</Text>),
+        bare ? null : line('head', iconCol(undefined, false, ''), shrink('head-t', <Text bold wrap="truncate-end">{c.head}</Text>)),
         ...c.rows.flatMap((r, ri) => {
           const open = r.n.id === selected
+          const detail = open ? t.detailClose : t.detailOpen
+          const wide = titleRoom(r, detail) >= TITLE_MIN
+          const metaParts = [r.info ? fixed('info', r.info, undefined, true) : null, r.status ? fixed('status', r.status, r.statusColor, !r.statusColor) : null]
           return [
             ri > 0 ? divider(`div:${r.n.id}`) : null,
             <Box key={`row:${r.n.id}`} flexDirection="column">
               {line(
                 'main',
                 iconCol(r.k, !!r.n.inserted, r.status || t.status[r.n.status]),
-                <Box flexShrink={1}>
+                shrink(
+                  'title',
                   <Text wrap="truncate-end" dimColor={r.k === 'todo'}>
                     {r.n.title}
-                  </Text>
-                </Box>,
+                  </Text>,
+                ),
                 <Box flexGrow={1} />,
-                r.info ? <Text dimColor>{r.info}</Text> : null,
-                r.status ? (
-                  <Text color={r.statusColor} dimColor={!r.statusColor}>
-                    {r.status}
-                  </Text>
-                ) : null,
-                btn(`detail:${r.n.id}`, open ? t.detailClose : t.detailOpen, () => update($, SELECTED, v => (v === r.n.id ? '' : r.n.id))),
+                ...(wide ? metaParts : []),
+                <Box key="detail-btn" flexShrink={0}>
+                  {btn(`detail:${r.n.id}`, detail, () => update($, SELECTED, v => (v === r.n.id ? '' : r.n.id)))}
+                </Box>,
               )}
+              {!wide && (r.info || r.status) ? line('meta', iconCol(undefined, false, ''), ...metaParts) : null}
               {r.sub && !open
                 ? line(
                     'sub',
                     iconCol(undefined, false, ''),
-                    <Text dimColor={!r.n.inserted} color={r.n.inserted ? (Svg ? T.ins : 'merged') : undefined} wrap="truncate-end">
-                      {r.sub}
-                    </Text>,
+                    shrink(
+                      'sub-t',
+                      <Text dimColor={!r.n.inserted} color={r.n.inserted ? (Svg ? T.ins : 'merged') : undefined} wrap="truncate-end">
+                        {r.sub}
+                      </Text>,
+                    ),
                   )
                 : null}
               {open
@@ -1389,26 +1414,24 @@ export const register: Register = (on, options) => {
                 line(
                   `pl-${p.id}`,
                   iconCol(p.total > 0 && p.done === p.total ? 'done' : p.running > 0 ? 'doing' : 'todo', false, ''),
-                  <Box flexShrink={1}>
-                    <Text wrap="truncate-end">{p.title || t.untitled}</Text>
-                  </Box>,
+                  shrink('title', <Text wrap="truncate-end">{p.title || t.untitled}</Text>),
                   <Box flexGrow={1} />,
-                  <Text dimColor>
-                    {[
-                      `${p.done}/${p.total}`,
-                      p.id === myPlan ? t.thisSession : '',
-                      t.sessionsN(p.sessions.filter(x => x !== mySession).length),
-                      fmtTime(p.updatedAt),
-                    ]
+                  fixed(
+                    'meta',
+                    [`${p.done}/${p.total}`, p.id === myPlan ? t.thisSession : '', t.sessionsN(p.sessions.filter(x => x !== mySession).length), fmtTime(p.updatedAt)]
                       .filter(Boolean)
-                      .join(' · ')}
-                  </Text>,
-                  p.id === myPlan
-                    ? btn(`leave-${p.id}`, t.leave, async () => {
-                        await bindPlan($, '')
-                        $.ui.toast(t.left)
-                      })
-                    : btn(`join-${p.id}`, myPlan ? t.switchTo : t.join, async () => $.ui.toast(await joinPlan($, p.id))),
+                      .join(' · '),
+                    undefined,
+                    true,
+                  ),
+                  <Box key="act" flexShrink={0}>
+                    {p.id === myPlan
+                      ? btn(`leave-${p.id}`, t.leave, async () => {
+                          await bindPlan($, '')
+                          $.ui.toast(t.left)
+                        })
+                      : btn(`join-${p.id}`, myPlan ? t.switchTo : t.join, async () => $.ui.toast(await joinPlan($, p.id)))}
+                  </Box>,
                 ),
               ]),
             ])
@@ -1421,22 +1444,31 @@ export const register: Register = (on, options) => {
                 line(
                   `p${i}`,
                   iconCol(p.total > 0 && p.done === p.total ? 'done' : p.running > 0 ? 'doing' : 'todo', false, ''),
-                  <Button
-                    key={`project-${i}`}
-                    plain
-                    label={`${projectName(p.root)}${p.root === ownRoot ? ' ·' : ''}${p.title ? ` — ${p.title}` : ''}`}
-                    onPress={() => update($, VIEW_ROOT, () => (p.root === ownRoot ? '' : p.root))}
-                  />,
-                  <Box flexGrow={1} />,
-                  Svg ? (
-                    <Svg source={miniBar(p.done, p.total, T).source} alt={`${p.done}/${p.total}`} width={60} height={20} />
-                  ) : (
-                    segLine(`pbar-${i}`, [
-                      { text: '━'.repeat(Math.round((8 * p.done) / Math.max(1, p.total))), color: 'success' },
-                      { text: '━'.repeat(8 - Math.round((8 * p.done) / Math.max(1, p.total))), color: 'subtle' },
-                    ])
+                  // 按鈕的字不會自己省略：先按餘下的闊度截短（右邊的進度條與數字不縮）
+                  shrink(
+                    'name',
+                    <Button
+                      key={`project-${i}`}
+                      plain
+                      label={fitCells(
+                        `${projectName(p.root)}${p.root === ownRoot ? ' ·' : ''}${p.title ? ` — ${p.title}` : ''}`,
+                        Math.max(TITLE_MIN, cols - rowChrome - 10 - cells([`${p.done}/${p.total}`, t.statusLine(p.running, 0, 0), fmtTime(p.updatedAt)].filter(Boolean).join(' · ')) - 2),
+                      )}
+                      onPress={() => update($, VIEW_ROOT, () => (p.root === ownRoot ? '' : p.root))}
+                    />,
                   ),
-                  <Text dimColor>{[`${p.done}/${p.total}`, t.statusLine(p.running, 0, 0), fmtTime(p.updatedAt)].filter(Boolean).join(' · ')}</Text>,
+                  <Box flexGrow={1} />,
+                  <Box key="bar" flexShrink={0}>
+                    {Svg ? (
+                      <Svg source={miniBar(p.done, p.total, T).source} alt={`${p.done}/${p.total}`} width={60} height={20} />
+                    ) : (
+                      segLine(`pbar-${i}`, [
+                        { text: '━'.repeat(Math.round((8 * p.done) / Math.max(1, p.total))), color: 'success' },
+                        { text: '━'.repeat(8 - Math.round((8 * p.done) / Math.max(1, p.total))), color: 'subtle' },
+                      ])
+                    )}
+                  </Box>,
+                  fixed('meta', [`${p.done}/${p.total}`, t.statusLine(p.running, 0, 0), fmtTime(p.updatedAt)].filter(Boolean).join(' · '), undefined, true),
                 ),
               ),
             ])
@@ -1449,11 +1481,9 @@ export const register: Register = (on, options) => {
                 line(
                   `h${i}`,
                   iconCol(p.total > 0 && p.done === p.total ? 'done' : undefined, false, ''),
-                  <Box flexShrink={1}>
-                    <Text wrap="truncate-end">{p.title || t.untitled}</Text>
-                  </Box>,
+                  shrink('title', <Text wrap="truncate-end">{p.title || t.untitled}</Text>),
                   <Box flexGrow={1} />,
-                  <Text dimColor>{`${fmtTime(p.at)}  ${p.done}/${p.total}`}</Text>,
+                  fixed('meta', `${fmtTime(p.at)}  ${p.done}/${p.total}`, undefined, true),
                 ),
               ),
             ])

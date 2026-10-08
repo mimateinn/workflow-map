@@ -130,7 +130,7 @@ export function bandCards(map: WorkflowMap, view: StageView, lang: Lang, clk: Cl
   // 一行一步：[符號] [名稱（補空格，令同一張卡的「負責人 · 用時」對齊）]  [負責人 · 用時]
   const stepRow = (n: WorkflowNode, titleW: number): Seg[] => {
     const k = kindOf(n, ready, clk)
-    const meta = fitCells(metaOf(n, lang, clk, true), 16)
+    const meta = fitCells(metaOf(n, lang, clk), 16)
     const title = fitCells(n.title, 22)
     return [glyph(k, !!n.inserted), { text: ' ' }, { text: meta ? title + ' '.repeat(titleW - cells(title)) : title, dim: k === 'todo' }, ...(meta ? [{ text: `  ${meta}`, dim: true }] : [])]
   }

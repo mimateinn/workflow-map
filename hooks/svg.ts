@@ -7,6 +7,7 @@ import { allDone, columns, elapsedMin, fmtTime, isStale, readyIds, stats } from 
 import type { StageView } from './graph'
 import { STR } from './i18n'
 import type { Lang } from './i18n'
+import { fitCells } from './suggest'
 
 export type Theme = {
   /** 淡色面（卡底、線、未開始）的基色：深色主題用白、淺色主題用黑，再配透明度 */
@@ -101,11 +102,10 @@ export const kindOf = (n: WorkflowNode, ready: Set<string>, c: Clock = NO_CLOCK)
       ? 'stale'
       : n.status
 
-/** 卡片／列右邊的小字：負責人 · 用時 */
-export function metaOf(n: WorkflowNode, lang: Lang, c: Clock, short = false): string {
+/** 卡片／列右邊的小字：負責人（最多 10 格）· 用時（精簡：1h34m、1時34分）；一行，不換行 */
+export function metaOf(n: WorkflowNode, lang: Lang, c: Clock): string {
   const min = c.now ? elapsedMin(n, c.now) : undefined
-  const t = STR[lang]
-  return [n.owner ?? '', min === undefined ? '' : short ? t.durShort(min) : t.dur(min)].filter(Boolean).join(' · ')
+  return [n.owner ? fitCells(n.owner, 10) : '', min === undefined ? '' : STR[lang].durShort(min)].filter(Boolean).join(' · ')
 }
 
 /**
@@ -334,7 +334,7 @@ export function bandGraph(map: WorkflowMap, view: StageView, lang: Lang, T: Them
   // 中間各層的卡：放得下多少就畫多少（左右兩張小卡的位先留起）
   const levelCards = view.levels.map(lv => {
     const shown = lv.length > 3 ? lv.slice(0, 2) : lv
-    const cr: CardRow[] = shown.map(n => ({ k: kindOf(n, ready, clk), ins: !!n.inserted, label: n.title, meta: metaOf(n, lang, clk, true) }))
+    const cr: CardRow[] = shown.map(n => ({ k: kindOf(n, ready, clk), ins: !!n.inserted, label: n.title, meta: metaOf(n, lang, clk) }))
     if (lv.length > 3) cr.push({ label: t.moreRows(lv.length - 2), cls: 'd' })
     return { c: card(cr, lv.some(n => n.status === 'doing')), steps: lv }
   })
