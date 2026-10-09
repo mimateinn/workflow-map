@@ -234,7 +234,7 @@ const unitName = (u: Unit) => u.group ?? u.members[0]!.title
  * （最多每行 4 格）。匯流線只連相鄰兩行；其他依賴（跨階段、分行後不相鄰、向上）變成框內的「← 待 …」（只列未完成的）。
  * 「← 待」一行會改變框的大小、從而改變分行：重算到穩定為止（只會增加，最多 4 次）。
  */
-export function layoutFlow(map: WorkflowMap, o: { width: number; lang: Lang }): FlowLayout {
+export function layoutFlow(map: WorkflowMap, o: { width: number; lang: Lang; removed?: boolean }): FlowLayout {
   const t = STR[o.lang]
   const W = Math.max(200, Math.floor(o.width))
   const st = flowStructure(map)
@@ -242,7 +242,9 @@ export function layoutFlow(map: WorkflowMap, o: { width: number; lang: Lang }): 
   const layerOf = new Map<string, number>()
   st.layers.forEach((l, i) => l.forEach(u => layerOf.set(u, i)))
   const stageLabels = st.layers.map((_, i) => t.stage(i + 1, 1))
-  const gut = st.layers.length ? Math.max(40, ...stageLabels.map(s => tw(s, 11) + 10)) : 0
+  // 左欄的固定字（「階段 n」、有已移除一行時的「已移除」）永遠完整：欄闊由最長的一個決定，畫的時候不截
+  const gutLabels = [...stageLabels, ...(o.removed ? [t.removedTitle] : [])]
+  const gut = gutLabels.length ? Math.max(40, ...gutLabels.map(s => gutterW(s))) : 0
   const left = MARGIN + gut
   const avail = W - left - MARGIN
   // 組內一條鏈最多幾格（放得下）；更長的鏈分段
@@ -397,6 +399,9 @@ export function layoutFlow(map: WorkflowMap, o: { width: number; lang: Lang }): 
   return { width: W, height: Math.max(1, y + MARGIN), cellW: CW, gut, stages, units, buses }
 }
 
+/** 左欄放得下一個固定字要的闊度（字在 MARGIN 開始，右邊留 10px 才到框） */
+export const gutterW = (label: string) => tw(label, 11) + 10
+
 /** 「← 待 X、Y」 */
 const waitsText = (t: (typeof STR)[Lang], names: readonly string[]) => `← ${t.waitShort(names.join(t.list))}`
 
@@ -425,7 +430,7 @@ export function flowSvg(map: WorkflowMap, lay: FlowLayout, lang: Lang, T: Theme,
   }
   const ink = (op: number) => `fill='${T.ink}' fill-opacity='${op}'`
   const out: string[] = []
-  for (const s of lay.stages) out.push(text(MARGIN, s.y + 18, fit(s.label, 11, lay.gut - 8), 'm'))
+  for (const s of lay.stages) out.push(text(MARGIN, s.y + 18, s.label, 'm'))
   // 匯流線：一條橫線 + 上面落下的短豎線 + 進入下一行框頂的短箭咀（進行中的目標用強調色；提醒用點線、沒有箭咀）
   for (const b of lay.buses) {
     const any = b.downs.some(d => hot(d.to))
@@ -493,7 +498,7 @@ export function flowSvg(map: WorkflowMap, lay: FlowLayout, lang: Lang, T: Theme,
     const label = STR[lang].removedTitle
     let x = lay.gut
     let y = lay.height + 8
-    out.push(text(MARGIN, y + 16, fit(label, 11, lay.gut - 8), 'm'))
+    out.push(text(MARGIN, y + 16, label, 'm'))
     for (const title of marks.removed) {
       const s = fit(title, 12, lay.width - lay.gut - 24)
       const w = tw(s) + 20

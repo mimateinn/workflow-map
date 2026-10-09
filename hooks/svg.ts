@@ -7,7 +7,7 @@ import { allDone, columns, elapsedMin, fmtTime, impactText, insertedHot, inserte
 import type { StageView } from './graph'
 import { STR } from './i18n'
 import type { Lang } from './i18n'
-import { fitCells } from './suggest'
+import { cells, fitCells } from './suggest'
 
 export type Theme = {
   /** 淡色面（卡底、線、未開始）的基色：深色主題用白、淺色主題用黑，再配透明度 */
@@ -120,10 +120,41 @@ export const kindOf = (n: WorkflowNode, ready: Set<string>, c: Clock = NO_CLOCK)
       ? 'stale'
       : n.status
 
-/** 卡片／列右邊的小字：負責人（最多 10 格）· 用時（精簡：1h34m、1時34分）；一行，不換行 */
-export function metaOf(n: WorkflowNode, lang: Lang, c: Clock): string {
+/** 負責人在畫面上最多佔幾格 */
+export const OWNER_CELLS = 10
+/** 常見子代理類型的短名（其餘按 ownerLabel 的規則縮短） */
+const OWNER_ALIAS: Record<string, string> = { 'general-purpose': 'agent' }
+
+/**
+ * 負責人在畫面上的短名（只影響畫面；計劃裏的 owner、詳情、匯出、指著卡片圖時的「完整名稱」清單都是完整的）：
+ * general-purpose → agent；plugin:agent → agent；ocx-grok-4-7 → grok-4.7、ocx-gpt-6-1-sol → gpt-6.1（太長時去掉版本後面的部分）；
+ * 三段以上、超過 10 格的 id：前面幾段取首字母（codebase-memory-scout → cm-scout）；其他（Explore、Plan、Sonnet、自由文字）
+ * 照舊，超過 OWNER_CELLS 格的截短加「…」。
+ */
+export function ownerLabel(owner: string): string {
+  let s = owner.trim()
+  const alias = OWNER_ALIAS[s.toLowerCase()]
+  if (alias) return alias
+  if (/^[\w.-]+(:[\w.-]+)+$/.test(s)) s = s.slice(s.lastIndexOf(':') + 1)
+  if (/^[a-z0-9]+(-[a-z0-9]+)+$/i.test(s)) {
+    if (/^ocx-/i.test(s)) {
+      s = s.slice(4).replace(/(\d)-(?=\d)/g, '$1.')
+      if (cells(s) > OWNER_CELLS) s = s.replace(/^(.*?\d+(?:\.\d+)*)-.*$/, '$1')
+    } else if (cells(s) > OWNER_CELLS) {
+      const parts = s.split('-')
+      if (parts.length >= 3) s = `${parts.slice(0, -1).map(p => p[0]).join('')}-${parts[parts.length - 1]}`
+    }
+  }
+  return fitCells(s, OWNER_CELLS)
+}
+
+/**
+ * 卡片／列右邊的小字：負責人（短名，見 ownerLabel；full = 完整的負責人，給指著時的清單）· 用時（精簡：1h34m、1時34分）；
+ * 一行，不換行
+ */
+export function metaOf(n: WorkflowNode, lang: Lang, c: Clock, full = false): string {
   const min = c.now ? elapsedMin(n, c.now) : undefined
-  return [n.owner ? fitCells(n.owner, 10) : '', min === undefined ? '' : STR[lang].durShort(min)].filter(Boolean).join(' · ')
+  return [n.owner ? (full ? n.owner : ownerLabel(n.owner)) : '', min === undefined ? '' : STR[lang].durShort(min)].filter(Boolean).join(' · ')
 }
 
 /**
@@ -297,9 +328,16 @@ type Card = { rows: CardRow[]; w: number; hot: boolean }
 const CARD_ROW = 18
 const CARD_GAP = 24
 const MAX_LABEL = 150
+const MAX_META = 80
+
+/** 卡片右邊的小字：「負責人 · 用時」放不下時先拿走用時，仍放不下才截負責人 */
+function cardMeta(n: WorkflowNode, lang: Lang, c: Clock): string {
+  const meta = metaOf(n, lang, c)
+  return n.owner && tw(meta, 11) > MAX_META ? ownerLabel(n.owner) : meta
+}
 
 function card(rows: CardRow[], hot: boolean): Card {
-  const fitted = rows.map(r => ({ ...r, label: fit(r.label, 12, MAX_LABEL), meta: r.meta ? fit(r.meta, 11, 80) : '' }))
+  const fitted = rows.map(r => ({ ...r, label: fit(r.label, 12, MAX_LABEL), meta: r.meta ? fit(r.meta, 11, MAX_META) : '' }))
   const w = Math.max(...fitted.map(r => (r.k ? LABEL_X : 10) + (r.mark ? MARK_W : 0) + tw(r.label) + (r.meta ? 6 + tw(r.meta, 11) : 0) + 10))
   return { rows: fitted, w, hot }
 }
@@ -320,6 +358,8 @@ export type BandGraph = {
   ghost?: Pic
   /** 收起的步驟（計劃次序），給彈出清單用 */
   hiddenSteps: WorkflowNode[]
+  /** 中間的卡上標題或「負責人 · 用時」畫成「…」的步驟（畫面次序）：指著卡片圖時列出完整的名稱；沒有 = 不彈出 */
+  cut: WorkflowNode[]
   /** 中間那張圖畫了幾張卡、幾條卡與卡之間的線 */
   cards: number
   edges: number
@@ -358,21 +398,25 @@ export function bandGraph(map: WorkflowMap, view: StageView, lang: Lang, T: Them
   // 中間各層的卡：放得下多少就畫多少（左右兩張小卡的位先留起）
   const levelCards = view.levels.map(lv => {
     const shown = lv.length > 3 ? lv.slice(0, 2) : lv
-    const cr: CardRow[] = shown.map(n => ({ k: kindOf(n, ready, clk), ins: insHot(n, clk), fresh: insFresh(n, clk), mark: insMark(n, clk), label: n.title, meta: metaOf(n, lang, clk) }))
+    const cr: CardRow[] = shown.map(n => ({ k: kindOf(n, ready, clk), ins: insHot(n, clk), fresh: insFresh(n, clk), mark: insMark(n, clk), label: n.title, meta: cardMeta(n, lang, clk) }))
+    // 畫成「…」：標題放不下，或「負責人 · 用時」截短了（包括負責人本身被截到 OWNER_CELLS 格）
+    const cut = shown.filter((n, i) => tw(n.title) > MAX_LABEL || fit(cr[i]!.meta ?? '', 11, MAX_META).includes('…'))
     if (lv.length > 3) cr.push({ label: t.moreRows(lv.length - 2), cls: 'd' })
-    return { c: card(cr, lv.some(n => n.status === 'doing')), steps: lv }
+    return { c: card(cr, lv.some(n => n.status === 'doing')), steps: lv, cut }
   })
   const doneCard = view.done.length ? card([{ k: 'done', label: t.doneCard(view.done.length) }], false) : undefined
   const doneW = doneCard ? doneCard.w + CARD_GAP : 0
   const ghostReserve = (n: number) => CARD_GAP + 20 + tw(t.laterCard(n)) + 20
   const placed: Card[] = []
   const hiddenSteps: WorkflowNode[] = []
+  const cut: WorkflowNode[] = []
   let used = BAND_INSET + doneW
-  levelCards.forEach(({ c, steps }, i) => {
+  levelCards.forEach(({ c, steps, cut: cutHere }, i) => {
     const rest = levelCards.slice(i + 1).reduce((n, x) => n + x.steps.length, 0) + view.later.length
     const fits = used + (placed.length ? CARD_GAP : 0) + c.w + (rest ? ghostReserve(rest + steps.length) : 0) <= maxW
     if (hiddenSteps.length || (placed.length && !fits)) return void hiddenSteps.push(...steps)
     placed.push(c)
+    cut.push(...cutHere)
     used += (placed.length > 1 ? CARD_GAP : 0) + c.w
   })
   hiddenSteps.push(...view.later)
@@ -417,7 +461,7 @@ export function bandGraph(map: WorkflowMap, view: StageView, lang: Lang, T: Them
     const gh = drawCard(gc, gx, gp, true)
     ghost = pic(gx + gc.w + 1, gh, gp)
   }
-  return { done, main, ghost, hiddenSteps: hidden, cards: placed.length, edges }
+  return { done, main, ghost, hiddenSteps: hidden, cut, cards: placed.length, edges }
 }
 
 // ---------------- 全圖：GitLab 式階段卡（由上而下） ----------------
@@ -494,15 +538,19 @@ export type PaneRow = {
 }
 export type PaneCard = { key: string; head: string; headIcon?: Kind; headDim: boolean; rows: PaneRow[]; note?: string }
 
-/** 階段卡的內容：[已完成 9 項]（收起；展開時列出）→ 階段 1…（每層一張）→ [稍後 5 項]。 */
-export function paneCards(map: WorkflowMap, view: StageView, o: { lang: Lang; doneOpen: boolean; clock?: Clock }): PaneCard[] {
+/**
+ * 階段卡的內容：[已完成 9 項]（收起；展開時列出）→ 階段 1…（每層一張）→ [稍後 5 項]。
+ * hideWaits：步驟 id → 不列入灰色「← 待」的前置（插入後的改動畫面已用紫色「改為等 ◇X」一行說了，不重複）。
+ */
+export function paneCards(map: WorkflowMap, view: StageView, o: { lang: Lang; doneOpen: boolean; clock?: Clock; hideWaits?: ReadonlyMap<string, readonly string[]> }): PaneCard[] {
   const c = o.clock ?? NO_CLOCK
   const t = STR[o.lang]
   const ready = readyIds(map.nodes)
   const byId = new Map(map.nodes.map(n => [n.id, n]))
   const row = (n: WorkflowNode): PaneRow => {
     const k = kindOf(n, ready, c)
-    const waiting = n.deps.map(d => byId.get(d)).filter((d): d is WorkflowNode => !!d && isStep(d) && d.status !== 'done')
+    const hidden = o.hideWaits?.get(n.id) ?? []
+    const waiting = n.deps.map(d => byId.get(d)).filter((d): d is WorkflowNode => !!d && isStep(d) && d.status !== 'done' && !hidden.includes(d.id))
     const sub = [
       n.inserted && (insHot(n, c) || insMark(n, c)) ? [fmtTime(n.inserted.at), n.inserted.note].filter(Boolean).join(' · ') : '',
       (k === 'todo' || k === 'blocked') && waiting.length ? `← ${t.waitShort(waiting.map(d => d.title).join(t.list))}` : '',

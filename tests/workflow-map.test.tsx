@@ -3,10 +3,10 @@ import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import { applyOp, columns, DONE_ID, downstreamOf, elapsedMin, emptyMap, etaRange, etaText, exportMarkdown, findCycle, focusedMap, focusSet, isStale, mergeMaps, migrate, MORE_ID, plainLines, planDiff, readyIds, stageView, stats, textDiagram, timeline, validateMap } from '../hooks/graph'
-import { detectLang, looksLikeRequest, resolveLang } from '../hooks/i18n'
-import { bandGraph, detailLines, metaOf, THEMES } from '../hooks/svg'
+import { detectLang, LANGS, looksLikeRequest, resolveLang, STR } from '../hooks/i18n'
+import { bandGraph, detailLines, esc, metaOf, ownerLabel, THEMES } from '../hooks/svg'
 import { demoMap, teamMap } from '../hooks/demo'
-import { flowOutline, flowStructure, flowSvg, layoutFlow, packChains } from '../hooks/flow'
+import { flowOutline, flowStructure, flowSvg, gutterW, layoutFlow, packChains } from '../hooks/flow'
 import type { WorkflowMap } from '../types/index'
 
 const TOOL = 'mcp__workflow-map__workflow_map'
@@ -2406,5 +2406,151 @@ describe('mid-plan requests: show the changes on the plan', () => {
     expect(back).not.toContain('now waits for ◇Lint')
     expect(JSON.stringify(files)).toBe(written)
     await ui.unmount()
+  })
+})
+
+// ---------------- 0.6.1：固定字不截、改動畫面不重複、標題一定看得見、負責人短名、指著卡片圖看完整名稱 ----------------
+
+describe('0.6.1', () => {
+  test('diagram: every stage label and "Removed" are drawn whole in all 7 languages; the left column fits the longest', () => {
+    const marks = { added: new Set<string>(), rewired: new Set<string>(), moved: new Map<string, string>(), blocked: new Set<string>(), removed: ['Old step'] }
+    // 12 個階段（一條直線）：最長的階段字是「階段 12」
+    const m = ok(applyOp(emptyMap(), { op: 'set_plan', nodes: Array.from({ length: 12 }, (_, i) => ({ id: `s${i}`, title: `Step ${i + 1}`, deps: i ? [`s${i - 1}`] : [] })) }, NOW))
+    for (const lang of LANGS) {
+      const lay = layoutFlow(m, { width: 600, lang, removed: true })
+      const svg = flowSvg(m, lay, lang, THEMES.dark, { now: 0, staleMin: 0 }, new Set(), marks).source
+      expect(lay.stages.length).toBe(12)
+      for (const label of [...lay.stages.map(s => s.label), STR[lang].removedTitle]) {
+        expect([lang, label, svg.includes(`>${label}</text>`)]).toEqual([lang, label, true])
+        expect([lang, label, gutterW(label) <= lay.gut]).toEqual([lang, label, true])
+      }
+    }
+  })
+
+  test('Show changes: the new step a rewired step waits for is only in the violet line; the grey "waits for" keeps the others or goes away', async ($, on) => {
+    world(on, {})
+    await $.session.start(START)
+    await $.tool.call({
+      tool: TOOL,
+      op: 'new_plan',
+      title: 'p',
+      nodes: [
+        { id: 'S', title: 'Setup', status: 'done' },
+        { id: 'A', title: 'Alpha', status: 'doing' },
+        { id: 'B', title: 'Beta', deps: ['A'] },
+        { id: 'C', title: 'Gamma', deps: ['S'] },
+      ],
+    })
+    await $.tool.call({ tool: TOOL, op: 'insert', note: 'sync too', nodes: [{ id: 'L', title: 'Sync across devices', deps: ['S'] }], before: ['B', 'C'] })
+    const ui = await $.ui.mount(PANE(120))
+    await ui.press({ key: 'detail:L' })
+    await ui.press({ key: 'changes:L' })
+    const all = await allText(ui)
+    // Beta 仍等 Alpha（灰色一行只剩 Alpha）；Gamma 只等新步驟（灰色一行不見了）；兩步都有紫色一行
+    expect(all.match(/now waits for ◇Sync across devices/g)?.length).toBe(2)
+    expect(all).toContain('← waits for Alpha')
+    expect(all).not.toMatch(/← waits for[^\n]*Sync across devices/)
+    expect(JSON.stringify(await ui.find({ key: 'row:C' }))).not.toContain('← waits for')
+    // 離開改動畫面：灰色一行照舊列出全部前置
+    await ui.press({ key: 'before-back' })
+    expect(await allText(ui)).toMatch(/← waits for[^\n]*Sync across devices/)
+    await ui.unmount()
+  })
+
+  test('at rest every step title is drawn as visible native text (never transparent, never left to another element), on every surface', async ($, on) => {
+    const LONG = 'Wire the export button to the new PDF renderer and the share sheet'
+    world(on, {})
+    await $.session.start(START)
+    await $.tool.call({
+      tool: TOOL,
+      op: 'set_plan',
+      nodes: [
+        { id: 'a', title: LONG, status: 'doing', owner: 'general-purpose' },
+        { id: 'b', title: '整理需求', status: 'blocked', owner: 'me', deps: [] },
+        { id: 'c', title: 'Docs', deps: ['a'] },
+      ],
+    } as never)
+    await $.tool.call({ tool: TOOL, op: 'insert', note: 'please also post it', nodes: [{ id: 'p', title: '確認後發帖', deps: ['b'] }], before: ['c'] })
+    for (const surface of ['desktop', 'terminal'] as const) {
+      const ui = await $.ui.mount(PANE(70, surface))
+      expect([surface, (await ui.findAll({ type: 'Client' })).length]).toEqual([surface, 0])
+      const texts = await ui.findAll({ type: 'Text' })
+      for (const title of [LONG, '整理需求', '確認後發帖']) {
+        const t = texts.find(x => x.text === title)
+        expect([surface, title, !!t, t?.props.color === '#00000000']).toEqual([surface, title, true, false])
+      }
+      await ui.unmount()
+    }
+  })
+
+  test('A: owner tags are short on screen (general-purpose → agent, ocx / long ids shortened, free text cut to 10 cells); the stored owner is untouched', async ($, on) => {
+    expect(
+      ['general-purpose', 'ocx-gpt-6-1-sol', 'ocx-grok-4-7', 'codebase-memory-scout', 'codebase-memory-auditor', 'engineering:code-review', 'Explore', 'Plan', 'Sonnet', 'me', '特效設計師兼動畫指導', 'A very long free text owner name'].map(ownerLabel),
+    ).toEqual(['agent', 'gpt-6.1', 'grok-4.7', 'cm-scout', 'cm-auditor', 'code-revi…', 'Explore', 'Plan', 'Sonnet', 'me', '特效設計…', 'A very lo…'])
+    const n = { id: 'a', title: 'x', status: 'doing' as const, deps: [], owner: 'general-purpose', startedAt: NOW }
+    const at = { now: Date.parse(NOW) + 94 * 60_000, staleMin: 0 }
+    expect([metaOf(n, 'en', at), metaOf(n, 'en', at, true)]).toEqual(['agent · 1h34m', 'general-purpose · 1h34m'])
+    // 卡片右邊放不下：先拿走用時，再截負責人
+    const m = ok(applyOp(emptyMap(), { op: 'set_plan', nodes: [{ id: 'a', title: 'Build', status: 'doing', owner: '特效設計師兼動畫指導' }] }, NOW))
+    const svg = bandGraph(m, stageView(m), 'zh-Hant', THEMES.dark, 900, at).main!.source
+    expect(svg).toContain('>特效設計…</text>')
+    expect(svg).not.toContain('1時34分')
+    const roomy = ok(applyOp(emptyMap(), { op: 'set_plan', nodes: [{ id: 'a', title: 'Build', status: 'doing', owner: 'general-purpose' }] }, NOW))
+    expect(bandGraph(roomy, stageView(roomy), 'en', THEMES.dark, 900, at).main!.source).toContain('>agent · 1h34m</text>')
+    // 介面：全圖顯示短名；計劃檔裏的負責人不變
+    const files: Record<string, string> = {}
+    world(on, files)
+    await $.session.start(START)
+    await $.tool.call({ tool: TOOL, op: 'set_plan', nodes: [{ id: 'a', title: 'Build', status: 'doing', owner: 'general-purpose' }] } as never)
+    const ui = await $.ui.mount(PANE(100))
+    const all = await allText(ui)
+    expect(all).toMatch(/^agent · \d+m$/m)
+    expect(all).not.toContain('general-purpose')
+    expect(cur(files).nodes[0].owner).toBe('general-purpose')
+    await ui.unmount()
+  })
+
+  test('B: hovering the card graph lists the full title and owner of every item drawn with "…" (two lines each, whole); none truncated = no list; the done / later lists are unchanged', async ($, on) => {
+    type El = { type?: string; key?: string; props: Record<string, unknown>; hover?: Record<string, unknown>; children?: (El | string | null)[] }
+    const kids = (e: El | undefined) => (e?.children ?? []).filter((c): c is El => !!c && typeof c === 'object')
+    const all = (e: El | undefined): El[] => (e ? [e, ...kids(e).flatMap(all)] : [])
+    const txt = (e: El | string | null | undefined): string => (typeof e === 'string' ? e : !e ? '' : (e.children ?? []).map(txt).join(''))
+    const LONG = 'Verify the merge: controllers, heat flux, thrust and attitude data'
+    world(on, {})
+    await $.session.start(START)
+    await $.tool.call({
+      tool: TOOL,
+      op: 'set_plan',
+      nodes: [
+        { id: 'd', title: 'Gather needs', status: 'done' },
+        { id: 'a', title: LONG, status: 'doing', owner: 'codebase-memory-auditor', deps: ['d'] },
+        { id: 'b', title: 'Short', status: 'doing', owner: 'A very long free text owner name', deps: ['d'] },
+        { id: 'c', title: 'Fits', status: 'doing', owner: 'me', deps: ['d'] },
+        { id: 'z', title: 'Release', deps: ['a', 'b', 'c'] },
+      ],
+    } as never)
+    const ui = await $.ui.mount({ plugin: 'workflow-map', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+    await ui.press({ key: 'toggle' })
+    const main = (await ui.find({ key: 'graph-main' })) as unknown as El
+    const pop = kids(main).find(c => c.type === 'Box' && c.props.display === 'none')
+    expect([pop?.hover?.display, pop?.props.position, pop?.props.width]).toEqual(['flex', 'absolute', 56])
+    const items = kids(pop).filter(c => c.type === 'Box' && c.props.flexDirection === 'column')
+    // 只列畫成「…」的兩項（長標題；負責人被截的一項），每項兩行，整句（會換行），不截
+    const lines = items.map(it => kids(it).map(l => all(l).find(e => e.type === 'Text')!))
+    expect(lines.map(([t, h]) => [txt(t), txt(h)])).toEqual([
+      [LONG, 'codebase-memory-auditor · 0m'],
+      ['Short', 'A very long free text owner name · 0m'],
+    ])
+    expect(lines.flat().map(e => e.props.wrap)).toEqual(['wrap', 'wrap', 'wrap', 'wrap'])
+    // 原有的「已完成」清單不變（一行、省略號）
+    const done = kids((await ui.find({ key: 'peek-done' })) as unknown as El).find(c => c.type === 'Box' && c.props.display === 'none')
+    expect(all(done).filter(e => e.type === 'Text').every(e => e.props.wrap === 'truncate-end')).toBe(true)
+    await ui.unmount()
+    // 全部放得下：卡片圖沒有清單
+    await $.tool.call({ tool: TOOL, op: 'new_plan', title: 'q', nodes: [{ id: 'x', title: 'Build UI', status: 'doing', owner: 'Astra' }, { id: 'y', title: 'Docs', deps: ['x'] }] } as never)
+    const ui2 = await $.ui.mount({ plugin: 'workflow-map', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
+    const main2 = (await ui2.find({ key: 'graph-main' })) as unknown as El
+    expect(kids(main2).map(c => c.type)).toEqual(['Svg'])
+    await ui2.unmount()
   })
 })

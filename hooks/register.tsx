@@ -992,12 +992,13 @@ export const register: Register = (on, options) => {
       const popW = Math.min(PEEK_W, (e.props.bodyColumns || 100) - 4)
       const textW = popW - 2 * SPACE.PAD - 2 - 4 // 框、內距、圖示欄（20px ≈ 3 格）與間距
       const Markdown = 'Markdown' in table ? table.Markdown : undefined
-      const peekLine = (icon: RenderChildren, text: string, dim: boolean) => (
+      // whole = 整句（會換行）：「完整名稱」清單用；其餘清單一行、省略號
+      const peekLine = (icon: RenderChildren, text: string, dim: boolean, whole = false) => (
         <Box flexDirection="row" alignItems="center" gap={SPACE.GAP}>
           <Box flexShrink={0}>{icon}</Box>
           <Box flexShrink={1} minWidth={0} overflow="hidden">
-            <Text dimColor={dim} wrap="truncate-end">
-              {fitCells(text, textW) || ' '}
+            <Text dimColor={dim} wrap={whole ? 'wrap' : 'truncate-end'}>
+              {(whole ? text : fitCells(text, textW)) || ' '}
             </Text>
           </Box>
         </Box>
@@ -1007,6 +1008,7 @@ export const register: Register = (on, options) => {
         more: number,
         anchor: { left: number } | { right: number },
         full: { key: string; open: () => Promise<unknown> },
+        whole = false,
       ) => (
         <Box
           position="absolute"
@@ -1024,8 +1026,8 @@ export const register: Register = (on, options) => {
         >
           {rows.map(({ n, hint }) => (
             <Box flexDirection="column">
-              {peekLine(<Svg source={iconPic(kindOf(n, ready, clock), insHot(n, clock), T).source} alt={t.status[n.status]} width={ICON_COL} height={ICON_COL} />, `${insMark(n, clock) ? '◇ ' : ''}${n.title}`, false)}
-              {peekLine(<Svg source={slotPic(T).source} alt="" width={ICON_COL} height={ICON_COL} />, hint, true)}
+              {peekLine(<Svg source={iconPic(kindOf(n, ready, clock), insHot(n, clock), T).source} alt={t.status[n.status]} width={ICON_COL} height={ICON_COL} />, `${insMark(n, clock) ? '◇ ' : ''}${n.title}`, false, whole)}
+              {peekLine(<Svg source={slotPic(T).source} alt="" width={ICON_COL} height={ICON_COL} />, hint, true, whole)}
             </Box>
           ))}
           {more > 0 ? (Markdown ? <Markdown text="---" /> : null) : null}
@@ -1047,6 +1049,9 @@ export const register: Register = (on, options) => {
       }
       const laterRows = (graph?.hiddenSteps ?? []).map(n => ({ n, hint: waitsOf(n) }))
       const doneRows = view.done.map(n => ({ n, hint: metaOf(n, lang, clock) }))
+      // 指著卡片圖：卡上畫成「…」的步驟，列出完整的標題與負責人（完整名稱 · 用時）；清單左邊貼橫條左邊
+      const cutRows = (graph?.cut ?? []).map(n => ({ n, hint: metaOf(n, lang, clock, true) }))
+      const cutAnchor = { left: -Math.floor((graph?.done?.width ?? 0) / PX_PER_COL_MAX) }
       // 稍後清單的位置：幽靈卡右邊到橫條左邊放得下就向左開（右邊對齊幽靈卡），否則左邊貼橫條左邊（不出界）。
       // 這裏的格寬用偏大的 PX_PER_COL_MAX：估錯只會令清單留在橫條內。
       const ghostLeftPx = (graph?.done?.width ?? 0) + (graph?.main?.width ?? 0)
@@ -1092,6 +1097,9 @@ export const register: Register = (on, options) => {
             {graph.main ? (
               <Box key="graph-main" flexShrink={0}>
                 <Svg source={graph.main.source} alt={plainLines(map, lang).join('\n')} width={graph.main.width} height={graph.main.height} />
+                {cutRows.length
+                  ? peek(cutRows.slice(0, PEEK_MAX), Math.max(0, cutRows.length - PEEK_MAX), cutAnchor, { key: 'peek-full-cut', open: () => openPane($, lang) }, true)
+                  : null}
               </Box>
             ) : null}
             {graph.ghost ? (
@@ -1286,7 +1294,9 @@ export const register: Register = (on, options) => {
     const hl: Lang = LANGS.includes(pickedHelp as Lang) ? (pickedHelp as Lang) : lang
     const hs = STR[hl]
     const s = stats(map)
-    const cards = paneCards(map, view, { lang, doneOpen: true, clock })
+    // 插入後的改動：改為等新步驟的（~）有紫色「改為等 ◇X」一行，灰色「← 待」不再重複列 X
+    const dRewired = new Map((diff?.rewired ?? []).map(r => [r.id, r.via]))
+    const cards = paneCards(map, view, { lang, doneOpen: true, clock, hideWaits: dRewired })
     const history = historyOpen && !foreign ? await readHistory($) : []
     const cols = (e.props as { bodyColumns?: number }).bodyColumns ?? 100
     const slot = Svg ? slotPic(T) : undefined
@@ -1399,7 +1409,6 @@ export const register: Register = (on, options) => {
     ]
     // 插入後的改動標記（階段卡）：標題前 + ／ ~；標題後「階段 3 → 4」、● 因此要等；~ 的步驟下面一行「改為等 ◇X」
     const dAdded = new Set(diff?.added ?? [])
-    const dRewired = new Map((diff?.rewired ?? []).map(r => [r.id, r.via]))
     const dMoved = new Map((diff?.moved ?? []).map(m => [m.id, m]))
     const dBlocked = new Set(diff?.blocked ?? [])
     const titleOf = (id: string) => map.nodes.find(n => n.id === id)?.title ?? id
@@ -1508,7 +1517,7 @@ export const register: Register = (on, options) => {
     const outline = diagram ? flowOutline(map, lang, Math.max(20, cols - PANE_INSET - 1), clock) : []
     let diagramPic: { source: string; width: number; height: number } | undefined
     if (diagram && Svg) {
-      const lay = layoutFlow(map, { width: Math.max(240, Math.round(cols * PX_PER_COL) - 16), lang })
+      const lay = layoutFlow(map, { width: Math.max(240, Math.round(cols * PX_PER_COL) - 16), lang, removed: !!marks?.removed.length })
       diagramPic = flowSvg(map, lay, lang, T, clock, marks ? new Set() : impactIds, marks)
       // Svg 的內容上限 131072 字（約 250 步以上才會超過）：超過就改用文字大綱
       if (diagramPic.source.length > 131072) diagramPic = undefined
