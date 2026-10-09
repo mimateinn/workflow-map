@@ -424,6 +424,44 @@ export function downstreamOf(nodes: readonly WorkflowNode[], ids: readonly strin
   return nodes.filter(n => seen.has(n.id) && !ids.includes(n.id) && isStep(n) && n.status !== 'done').map(n => n.id)
 }
 
+/**
+ * 兩份計劃的差異（插入前的快照 → 現在），用來在現在的計劃上標出一個中途要求改了甚麼：
+ * added = 之後才有的步驟；rewired = 本來已有、而依賴多了新步驟的（via = 那些新步驟）；
+ * moved = 依賴深度變深、移到後面階段的（階段 = 依賴深度 + 1，只算未取消的步驟）；
+ * blocked = 因新步驟而要等的全部未完成後續步驟（不含 added、rewired）；removed = 之前有、現在沒有或已取消的。
+ */
+export type PlanDiff = {
+  added: string[]
+  rewired: { id: string; via: string[] }[]
+  moved: { id: string; from: number; to: number }[]
+  blocked: string[]
+  removed: { id: string; title: string }[]
+}
+/** 預設的階段：依賴深度 + 1（只算未取消的步驟）。畫面可傳入自己的編號（階段卡、流程圖的行），令「3 → 4」與畫面一致 */
+const depthStages = (m: WorkflowMap) => new Map([...depths(m.nodes.filter(n => n.status !== 'dropped'))].map(([id, d]) => [id, d + 1]))
+
+export function planDiff(before: WorkflowMap, after: WorkflowMap, stageOf: (m: WorkflowMap) => Map<string, number> = depthStages): PlanDiff {
+  const liveB = before.nodes.filter(n => n.status !== 'dropped')
+  const liveA = after.nodes.filter(n => n.status !== 'dropped')
+  const bById = new Map(liveB.map(n => [n.id, n]))
+  const aIds = new Set(liveA.map(n => n.id))
+  const added = liveA.filter(n => !bById.has(n.id)).map(n => n.id)
+  const isNew = new Set(added)
+  const kept = liveA.filter(n => bById.has(n.id))
+  const rewired = kept.map(n => ({ id: n.id, via: n.deps.filter(d => isNew.has(d) && !bById.get(n.id)!.deps.includes(d)) })).filter(r => r.via.length)
+  const sb = stageOf(before)
+  const sa = stageOf(after)
+  const moved = kept.flatMap(n => {
+    const from = sb.get(n.id)
+    const to = sa.get(n.id)
+    return from !== undefined && to !== undefined && to > from ? [{ id: n.id, from, to }] : []
+  })
+  const rew = new Set(rewired.map(r => r.id))
+  const blocked = downstreamOf(liveA, added).filter(id => !rew.has(id))
+  const removed = liveB.filter(n => !aIds.has(n.id)).map(n => ({ id: n.id, title: n.title }))
+  return { added, rewired, moved, blocked, removed }
+}
+
 /** 每步最多保留幾筆狀態紀錄 */
 export const LOG_MAX = 10
 
@@ -448,25 +486,49 @@ export function elapsedMin(n: WorkflowNode, nowMs: number): number | undefined {
   return end ? Math.max(0, Math.floor((end - start) / 60_000)) : undefined
 }
 
+/** 剩餘時間範圍（分鐘）：lo–hi；n = 用來估算的已完成步驟數；rough = 少於 ETA_SURE 步（只是粗估） */
+export type EtaRange = { lo: number; hi: number; n: number; rough: boolean }
+/** 至少幾個有時間的已完成步驟才估；少於 ETA_SURE 個時標「約／rough」 */
+export const ETA_MIN_STEPS = 3
+export const ETA_SURE = 6
+
+/** 已排序數列的分位數（線性內插） */
+function quantile(sorted: readonly number[], p: number): number {
+  const i = (sorted.length - 1) * p
+  const a = sorted[Math.floor(i)]!
+  const b = sorted[Math.ceil(i)]!
+  return a + (b - a) * (i - Math.floor(i))
+}
+
 /**
- * 剩餘時間估算（分鐘）：已完成而且有開始／完成時間的步驟 ≥ 3 才估（否則 undefined）。
- * 每步 = 已完成步驟用時的中位數（進行中的扣去已用時間）；同一層的並行步驟只算最長的一個，各層相加。
+ * 剩餘時間範圍：已完成而且有開始／完成時間的步驟 ≥ 3 才估（否則 undefined）。
+ * 一步的用時取已完成步驟用時的 p25（lo）與 p75（hi）——用時越參差，範圍越闊。
+ * 沿依賴分層（關鍵路徑）相加：同一層的並行步驟只算最長的一步；進行中的扣去已用時間（最少 0）。
  */
-export function etaMin(map: WorkflowMap, nowMs: number): number | undefined {
+export function etaRange(map: WorkflowMap, nowMs: number): EtaRange | undefined {
   const durs = map.nodes
     .filter(n => n.status === 'done' && n.startedAt && n.doneAt)
     .map(n => (ms(n.doneAt) - ms(n.startedAt)) / 60_000)
     .filter(d => d >= 0)
     .sort((a, b) => a - b)
-  if (durs.length < 3) return undefined
-  const mid = durs.length >> 1
-  const median = durs.length % 2 ? durs[mid]! : (durs[mid - 1]! + durs[mid]!) / 2
+  if (durs.length < ETA_MIN_STEPS) return undefined
   const open = map.nodes.filter(n => isStep(n) && n.status !== 'done')
   if (open.length === 0) return undefined
-  let total = 0
-  for (const level of columns(open))
-    total += Math.max(...level.map(n => (n.status === 'doing' && n.startedAt ? Math.max(0, median - (nowMs - ms(n.startedAt)) / 60_000) : median)))
-  return Math.round(total)
+  const levels = columns(open)
+  const along = (step: number) =>
+    levels.reduce((sum, level) => sum + Math.max(...level.map(n => (n.status === 'doing' && n.startedAt ? Math.max(0, step - (nowMs - ms(n.startedAt)) / 60_000) : step))), 0)
+  const lo = Math.round(along(quantile(durs, 0.25)))
+  return { lo, hi: Math.max(lo, Math.round(along(quantile(durs, 0.75)))), n: durs.length, rough: durs.length < ETA_SURE }
+}
+
+/** 剩餘時間的字：「≈ 40–70 分鐘」；粗估（少於 6 步）改為「約 40–70 分鐘」；short = 橫條用的短格式。沒有估算 → '' */
+export function etaText(map: WorkflowMap, nowMs: number, lang: Lang, short = false): string {
+  const r = etaRange(map, nowMs)
+  if (!r) return ''
+  const t = STR[lang]
+  const d = short ? t.durShort : t.dur
+  const range = r.lo === r.hi ? d(r.lo) : r.hi < 60 ? `${r.lo}–${d(r.hi)}` : `${d(r.lo)}–${d(r.hi)}`
+  return `${r.rough ? t.roughMark : '≈'} ${range}`
 }
 
 /** 進行中但超過 staleMin 分鐘沒有更新（0 = 不檢查）。 */
@@ -695,7 +757,7 @@ export function exportMarkdown(map: WorkflowMap, lang: Lang, nowMs: number): str
   const view = stageView(map, { expandDone: true, expandFuture: true, smallPlan: Infinity })
   const ready = readyIds(map.nodes)
   const byId = new Map(map.nodes.map(n => [n.id, n]))
-  const eta = etaMin(map, nowMs)
+  const eta = etaText(map, nowMs, lang)
   const blocked = map.nodes.filter(n => n.status === 'blocked').length
   const line = (n: WorkflowNode): string[] => {
     const min = elapsedMin(n, nowMs)
@@ -713,7 +775,7 @@ export function exportMarkdown(map: WorkflowMap, lang: Lang, nowMs: number): str
   const out = [
     `# ${map.title || t.paneTitle}`,
     '',
-    `**${t.progress}:** ${s.done}/${s.total}${[t.statusLine(s.doing.length, blocked, ready.size), eta === undefined ? '' : `≈ ${t.dur(eta)}`]
+    `**${t.progress}:** ${s.done}/${s.total}${[t.statusLine(s.doing.length, blocked, ready.size), eta]
       .filter(Boolean)
       .map(x => ` · ${x}`)
       .join('')}`,

@@ -81,6 +81,12 @@ declare module 'claude-code' {
       before: string
       /** 全圖面板「時間線」是否展開 */
       timelineOpen: boolean
+      /** 全圖面板正在看「插入後的改動」的插入步驟 id（'' = 沒有） */
+      changes: string
+      /** 用戶這次親手輸入、看似新要求的原文 */
+      asked: string
+      /** 一輪結束時仍未記入計劃的要求原文（'' = 沒有） */
+      unrecorded: string
       /** 全圖面板「已完成」一欄是否展開 */
       doneOpen: boolean
       /** 全圖面板「較遠的未來」是否展開 */

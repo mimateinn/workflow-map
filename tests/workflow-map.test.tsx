@@ -2,7 +2,7 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-import { applyOp, columns, DONE_ID, downstreamOf, elapsedMin, emptyMap, etaMin, exportMarkdown, findCycle, focusedMap, focusSet, isStale, mergeMaps, migrate, MORE_ID, plainLines, readyIds, stageView, stats, textDiagram, timeline, validateMap } from '../hooks/graph'
+import { applyOp, columns, DONE_ID, downstreamOf, elapsedMin, emptyMap, etaRange, etaText, exportMarkdown, findCycle, focusedMap, focusSet, isStale, mergeMaps, migrate, MORE_ID, plainLines, planDiff, readyIds, stageView, stats, textDiagram, timeline, validateMap } from '../hooks/graph'
 import { detectLang, looksLikeRequest, resolveLang } from '../hooks/i18n'
 import { bandGraph, detailLines, metaOf, THEMES } from '../hooks/svg'
 import { demoMap, teamMap } from '../hooks/demo'
@@ -1019,7 +1019,7 @@ describe('notifications', () => {
   })
 })
 
-describe('eta', () => {
+describe('eta (honest range)', () => {
   const at = (min: number) => new Date(Date.parse(NOW) + min * 60_000).toISOString()
   const node = (id: string, status: 'done' | 'doing' | 'todo', deps: string[], started?: number, done?: number) => ({
     id,
@@ -1029,35 +1029,49 @@ describe('eta', () => {
     ...(started === undefined ? {} : { startedAt: at(started) }),
     ...(done === undefined ? {} : { doneAt: at(done) }),
   })
+  const mk = (nodes: ReturnType<typeof node>[]) => ({ ...emptyMap(), nodes }) as never
 
-  test('median of finished steps × stages, parallel steps counted once per stage', () => {
-    const map = {
-      ...emptyMap(),
-      nodes: [
-        node('a', 'done', [], 0, 10),
-        node('b', 'done', ['a'], 10, 30),
-        node('c', 'done', ['b'], 30, 60),
-        // 第 1 層：進行中（已用 5 分）與未開始並行 → max(20 − 5, 20) = 20
-        node('d', 'doing', ['c'], 65),
-        node('e', 'todo', ['c']),
-        // 第 2 層 → 20
-        node('f', 'todo', ['d', 'e']),
-      ],
-    }
-    expect(etaMin(map as never, Date.parse(at(70)))).toBe(40)
-    // 少於 3 個有時間的已完成步驟：不估
-    expect(etaMin({ ...map, nodes: map.nodes.filter(n => n.id !== 'a') } as never, Date.parse(at(70)))).toBeUndefined()
+  test('parallel steps in a stage count once (the longest); a running step adds its remaining time, floored at 0', () => {
+    const done3 = [node('a', 'done', [], 0, 20), node('b', 'done', ['a'], 20, 40), node('c', 'done', ['b'], 40, 60)]
+    // 第 1 層：進行中（已用 5 分）與兩個未開始並行 → max(20 − 5, 20, 20) = 20；第 2 層 → 20
+    const map = mk([...done3, node('d', 'doing', ['c'], 65), node('e', 'todo', ['c']), node('g', 'todo', ['c']), node('f', 'todo', ['d', 'e', 'g'])])
+    expect(etaRange(map, Date.parse(at(70)))).toEqual({ lo: 40, hi: 40, n: 3, rough: true })
+    // 只剩進行中的一步、已用了比一般更長的時間 → 0，不會是負數
+    expect(etaRange(mk([...done3, node('d', 'doing', ['c'], 0)]), Date.parse(at(70)))).toMatchObject({ lo: 0, hi: 0 })
+    // 進行中已用 10 分，一般用時 20–40 → 還需 10–30
+    const spread = [node('a', 'done', [], 0, 20), node('b', 'done', ['a'], 20, 40), node('x', 'done', [], 0, 40), node('y', 'done', [], 0, 40), node('z', 'done', [], 0, 40)]
+    expect(etaRange(mk([...spread, node('d', 'doing', [], 60)]), Date.parse(at(70)))).toMatchObject({ lo: 10, hi: 30 })
   })
 
-  test('the band and the pane show ≈ time when the demo has enough timings', async ($, on) => {
+  test('the range widens with the spread of finished times; under 3 timed steps nothing is shown; under 6 it is marked rough', () => {
+    const even = mk([node('a', 'done', [], 0, 25), node('b', 'done', [], 0, 25), node('c', 'done', [], 0, 25), node('d', 'done', [], 0, 25), node('t', 'todo', [])])
+    const uneven = mk([node('a', 'done', [], 0, 10), node('b', 'done', [], 0, 20), node('c', 'done', [], 0, 30), node('d', 'done', [], 0, 40), node('t', 'todo', [])])
+    const now = Date.parse(at(100))
+    const e = etaRange(even, now)!
+    const u = etaRange(uneven, now)!
+    expect([e.lo, e.hi]).toEqual([25, 25])
+    expect([u.lo, u.hi]).toEqual([18, 33]) // p25 = 17.5、p75 = 32.5
+    expect(u.hi - u.lo).toBeGreaterThan(e.hi - e.lo)
+    expect(etaText(uneven, now, 'en')).toBe('rough 18–33m')
+    expect(etaText(uneven, now, 'zh-Hant')).toBe('約 18–33 分鐘')
+    const two = mk([node('a', 'done', [], 0, 10), node('b', 'done', [], 0, 20), node('t', 'todo', [])])
+    expect([etaRange(two, now), etaText(two, now, 'en')]).toEqual([undefined, ''])
+    const six = mk([...[1, 2, 3, 4, 5, 6].map(i => node(`d${i}`, 'done', [], 0, 30 + i * 10)), node('t', 'todo', [])])
+    expect(etaRange(six, now)!.rough).toBe(false)
+    expect(etaText(six, now, 'en')).toBe('≈ 53m–1h 18m')
+  })
+
+  test('the band and the pane show the range; the pane bar explains how it is computed', async ($, on) => {
     world(on, {})
     await $.session.start(START)
     await $.command.run({ command: 'workflow-demo', args: '', origin: { kind: 'composer' } } as never)
     const band = await $.ui.mount({ plugin: 'workflow-map', surface: 'desktop', component: 'AbovePrompt', props: BAND_PROPS })
-    expect(await svgText(band)).toMatch(/≈ \dh/)
+    expect(await svgText(band)).toMatch(/rough \d+h\d*m?–\d+h/)
     await band.unmount()
     const pane = await $.ui.mount({ plugin: 'workflow-map', surface: 'desktop', component: 'Pane', requestId: 'workflow-map', props: { title: 'x', isFocused: false, bodyColumns: 120 } as never })
-    expect(await allText(pane)).toMatch(/≈ \dh/)
+    expect(await allText(pane)).toMatch(/rough \d+h( \d+m)?–\d+h/)
+    const bar = (await pane.findAll({ type: 'Svg' })).find(s => String(s.props.alt).includes('middle half'))
+    expect(String(bar?.props.alt)).toContain('the middle half of 5 finished steps')
     await pane.unmount()
   })
 })
@@ -2190,7 +2204,10 @@ describe('inserted steps: violet only for this turn', () => {
     const ui = await $.ui.mount(PANE(120))
     await ui.press({ key: 'fold-done' })
     const icons = (await ui.findAll({ type: 'Svg' })).filter(s => Number(s.props.width) === 20).map(s => String(s.props.source))
-    expect(icons.filter(s => s.includes(V)).length).toBe(2)
+    // 本輪剛插入的那一步另有一圈擴散三次的紫色外圈（記錄了的確認），不算進「紫色圖示」
+    const noPulse = (x: string) => x.replace(/<path class='q'[^>]*\/>/g, '')
+    expect(icons.filter(s => noPulse(s).includes(V)).length).toBe(2)
+    expect(icons.filter(s => s.includes("class='q'")).length).toBe(1)
     const texts = await ui.findAll({ type: 'Text' })
     expect(texts.filter(x => x.text === '◇').map(x => x.props.dimColor)).toEqual([true])
     expect(texts.find(x => x.text.includes('new idea'))?.props.color).toBe(V)
@@ -2212,13 +2229,182 @@ describe('inserted steps: violet only for this turn', () => {
     const map = sample() as unknown as WorkflowMap
     const clock = { now: Date.parse(at(3)), staleMin: 30, turnAt: Date.parse(NOW) }
     const svg = flowSvg(map, layoutFlow(map, { width: 600, lang: 'en' }), 'en', THEMES.dark, clock).source
-    expect(svg.split(V).length - 1).toBe(2)
+    expect(noPulse(svg).split(V).length - 1).toBe(2)
+    expect(svg.split("class='q'").length - 1).toBe(1)
     expect(svg.split('>◇<').length - 1).toBe(1)
     const band = bandGraph(map, stageView(map, { expandFuture: true }), 'en', THEMES.dark, 900, clock).main!.source
-    expect([band.split(V).length - 1, band.split('>◇<').length - 1]).toEqual([1, 1])
+    expect([noPulse(band).split(V).length - 1, band.split('>◇<').length - 1, band.split("class='q'").length - 1]).toEqual([1, 1, 1])
     // 下一輪：本輪完成的變回一般完成；本輪加的仍未完成 → 一般圖示 + 淡色 ◇
     const next = { ...clock, now: Date.parse(at(30)), turnAt: Date.parse(at(20)) }
     const svg2 = flowSvg(map, layoutFlow(map, { width: 600, lang: 'en' }), 'en', THEMES.dark, next).source
-    expect([svg2.split(V).length - 1, svg2.split('>◇<').length - 1]).toEqual([0, 2])
+    expect([svg2.split(V).length - 1, svg2.split('>◇<').length - 1, svg2.split("class='q'").length - 1]).toEqual([0, 2, 0])
+  })
+})
+
+describe('mid-plan requests: was it recorded?', () => {
+  const ASK = 'please also export the weekly report as a PDF for the team'
+  const setup = async ($: Engine, on: On) => {
+    const files: Record<string, string> = {}
+    const w = world(on, files)
+    const filled: string[] = []
+    const submitted: string[] = []
+    on('turn.start', ($, e) => ({ turnId: e.turnId }))
+    on('turn.complete', () => ({ text: '' }) as never)
+    on('prompt.submit', ($, e) => (submitted.push(e.text), { text: e.text }) as never)
+    on('prompt.fill', ($, e) => (filled.push(e.text), { isFilled: true }) as never)
+    await $.session.start(START)
+    await $.tool.call({ tool: TOOL, op: 'new_plan', title: 'p', nodes: [{ id: 'A', title: 'Alpha', status: 'doing' }, { id: 'B', title: 'Beta', deps: ['A'] }] })
+    return { w, files, filled, submitted }
+  }
+  const typed = ($: Engine, text: string) => $.prompt.submit({ text, origin: { kind: 'composer' } } as never)
+  const endTurn = ($: Engine) => $.turn.complete({ reason: 'answer', answer: 'ok', durationMs: 1, isAborted: false, turnId: 't1' } as never)
+  const band = ($: Engine, surface: 'desktop' | 'terminal' = 'desktop') => $.ui.mount({ plugin: 'workflow-map', surface, component: 'AbovePrompt', props: BAND_PROPS })
+
+  test('Claude records a request with insert: a short toast with the user words, and the new ◇ step pulses this turn', async ($, on) => {
+    const { w } = await setup($, on)
+    await $.turn.start({ text: ASK, turnId: 't1' } as never)
+    await w.clock.advance(1000)
+    await $.tool.call({ tool: TOOL, op: 'insert', note: ASK, nodes: [{ id: 'X', title: 'PDF export' }] })
+    expect(w.toasts.at(-1)).toBe('Recorded: please also export the…')
+    const ui = await band($)
+    await ui.press({ key: 'toggle' })
+    // 卡片圖裏那一步的圖示外一圈紫色菱形，擴散三次就停（標題行的「下一步」只是字，沒有圖示）
+    const main = (await ui.findAll({ type: 'Svg' })).map(s => String(s.props.source)).filter(s => s.includes('>PDF export<') && s.includes("rx='4'"))
+    expect(main.length).toBe(1)
+    expect(main[0]!.split("class='q'").length - 1).toBe(1)
+    expect(main[0]).toContain('animation:wmq 1.4s ease-out 3')
+    await ui.unmount()
+  })
+
+  test('a typed request that ends the turn with no plan op: "Not on the plan: …" with Add to plan (draft only) and ✕; once per message', async ($, on) => {
+    const { filled, submitted } = await setup($, on)
+    await typed($, ASK)
+    await endTurn($)
+    const ui = await band($)
+    const texts = async () => (await ui.findAll({ type: 'Text' })).map(x => x.text)
+    expect(await texts()).toContain('Not on the plan: please also…')
+    const before = submitted.length
+    await ui.press({ key: 'add-to-plan' })
+    expect(filled).toEqual([`Add this to the plan: ${ASK}`])
+    expect(submitted.length).toBe(before) // 從不自動送出
+    expect((await texts()).some(x => x.startsWith('Not on the plan'))).toBe(false)
+    // 同一則訊息不會再提示
+    await endTurn($)
+    expect((await texts()).some(x => x.startsWith('Not on the plan'))).toBe(false)
+    // 新的一則：再提示；✕ 收起
+    await typed($, 'and also send the PDF to the whole team by email please')
+    await endTurn($)
+    expect((await texts()).some(x => x.startsWith('Not on the plan: and also send'))).toBe(true)
+    await ui.press({ key: 'unrecorded-dismiss' })
+    expect((await texts()).some(x => x.startsWith('Not on the plan'))).toBe(false)
+    await ui.unmount()
+  })
+
+  test('no "Not on the plan" when Claude touched the plan that turn, or for an acknowledgement; the terminal shows the same row with keys', async ($, on) => {
+    await setup($, on)
+    await typed($, ASK)
+    await $.tool.call({ tool: TOOL, op: 'status', id: 'A', status: 'done' })
+    await endTurn($)
+    await typed($, 'ok')
+    await endTurn($)
+    const ui = await band($)
+    expect((await ui.findAll({ type: 'Text' })).some(x => x.text.startsWith('Not on the plan'))).toBe(false)
+    await ui.unmount()
+    await typed($, ASK)
+    await endTurn($)
+    const term = await band($, 'terminal')
+    expect((await term.findAll({ type: 'Text' })).some(x => x.text === 'Not on the plan: please also…')).toBe(true)
+    expect((await term.findAll({ type: 'Button' })).filter(b => ['add-to-plan', 'unrecorded-dismiss'].includes(String(b.key))).map(b => b.props.hotkey)).toEqual(['a', 'x'])
+    await term.unmount()
+  })
+})
+
+describe('mid-plan requests: show the changes on the plan', () => {
+  test('planDiff: added, rewired (with the new step it now waits for), moved to a later stage, removed, and everything downstream', () => {
+    const before = ok(
+      applyOp(
+        emptyMap(),
+        {
+          op: 'set_plan',
+          nodes: [
+            { id: 'A', title: 'a', status: 'done' },
+            { id: 'B', title: 'b', deps: ['A'] },
+            { id: 'C', title: 'c', deps: ['B'] },
+            { id: 'D', title: 'd', deps: ['C'] },
+            { id: 'E', title: 'e', deps: ['A'] },
+            { id: 'F', title: 'f', deps: ['A'] },
+          ],
+        },
+        NOW,
+      ),
+    )
+    let after = ok(applyOp(before, { op: 'insert', note: 'x', nodes: [{ id: 'X', title: 'x', deps: ['B'] }], before: ['C'] }, LATER))
+    after = ok(applyOp(after, { op: 'status', id: 'E', status: 'dropped' }, LATER))
+    after = ok(applyOp(after, { op: 'remove', ids: ['F'] }, LATER))
+    expect(planDiff(before, after)).toEqual({
+      added: ['X'],
+      rewired: [{ id: 'C', via: ['X'] }],
+      moved: [
+        { id: 'C', from: 3, to: 4 },
+        { id: 'D', from: 4, to: 5 },
+      ],
+      blocked: ['D'],
+      removed: [
+        { id: 'E', title: 'e' },
+        { id: 'F', title: 'f' },
+      ],
+    })
+    expect(planDiff(after, after)).toEqual({ added: [], rewired: [], moved: [], blocked: [], removed: [] })
+  })
+
+  test('Details → Show changes marks the current plan (+, ~ now waits for ◇X, stage a → b, ●, struck removed) read-only; Before | After switch; Back', async ($, on) => {
+    const files: Record<string, string> = {}
+    world(on, files)
+    await $.session.start(START)
+    await $.tool.call({
+      tool: TOOL,
+      op: 'new_plan',
+      title: 'p',
+      nodes: [
+        { id: 'A', title: 'Alpha', status: 'doing' },
+        { id: 'B', title: 'Beta', deps: ['A'] },
+        { id: 'C', title: 'Gamma', deps: ['B'] },
+        { id: 'Z', title: 'Zeta', deps: ['A'] },
+      ],
+    })
+    await $.tool.call({ tool: TOOL, op: 'insert', note: 'also lint', nodes: [{ id: 'L', title: 'Lint', deps: ['A'] }], before: ['B'] })
+    await $.tool.call({ tool: TOOL, op: 'remove', ids: ['Z'] })
+    const ui = await $.ui.mount(PANE(120))
+    await ui.press({ key: 'detail:L' })
+    expect((await ui.findAll({ type: 'Button' })).filter(b => ['changes:L', 'before:L'].includes(String(b.key))).map(b => b.text)).toEqual(['Show changes', 'Plan before this request'])
+    const written = JSON.stringify(files)
+    await ui.press({ key: 'changes:L' })
+    const texts = await ui.findAll({ type: 'Text' })
+    const all = texts.map(x => x.text).join('\n')
+    for (const s of ['Changes since “Lint” was added', '+ added · ~ now waits for it', 'now waits for ◇Lint', 'Stage 2 → 3', 'Stage 3 → 4']) expect(all).toContain(s)
+    expect(texts.filter(x => x.text === '+').map(x => x.props.color)).toEqual([THEMES.dark.done])
+    expect(texts.filter(x => x.text === '~').map(x => x.props.color)).toEqual([THEMES.dark.ins])
+    expect(texts.filter(x => x.text === '●').map(x => x.props.color)).toEqual(['warning'])
+    expect(texts.find(x => x.text === 'Zeta')?.props.strikethrough).toBe(true)
+    for (const k of ['undo', 'export', 'history', 'plans', 'timeline', 'projects']) expect(await ui.find({ key: k })).toBeUndefined()
+    // 流程圖：綠框（新增）、紫框（改為等它）、「2→3」、刪除線的已移除
+    await ui.press({ key: 'diagram' })
+    const svg = String((await ui.findAll({ type: 'Svg' })).find(s => Number(s.props.height) > 20)?.props.source)
+    expect(svg).toContain(`fill='none' stroke='${THEMES.dark.done}' stroke-width='1.5'`)
+    expect(svg).toContain(`fill='none' stroke='${THEMES.dark.ins}' stroke-width='1.5'`)
+    expect(svg).toContain('>2→3<')
+    expect(svg).toContain('>Zeta<')
+    await ui.press({ key: 'diagram' })
+    // 插入前 | 插入後
+    await ui.press({ key: 'side-before' })
+    expect(await allText(ui)).toContain('Plan before “Lint” was added (read-only)')
+    await ui.press({ key: 'side-after' })
+    expect(await allText(ui)).toContain('Changes since “Lint” was added')
+    await ui.press({ key: 'before-back' })
+    const back = await allText(ui)
+    expect(back).not.toContain('Changes since')
+    expect(back).not.toContain('now waits for ◇Lint')
+    expect(JSON.stringify(files)).toBe(written)
+    await ui.unmount()
   })
 })

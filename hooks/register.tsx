@@ -3,8 +3,9 @@ import type { EngineInterface, Register, RenderChildren, UiPressArgument } from 
 
 import type { TodoItem, TodoMirror, WorkflowMap, WorkflowNode } from '../types/index'
 import { demoMap as demoPlan, teamMap } from './demo'
-import { flowOutline, flowSvg, layoutFlow, outlineText } from './flow'
-import { allDone, applyOp, compactLine, emptyMap, etaMin, exportMarkdown, findCycle, isActive, isStale, isStep, KINDS, mergeMaps, migrate, opSummary, plainLines, readyIds, STATUSES, stageView, stats, textDiagram, timeline, validateMap } from './graph'
+import { diagramStages, flowOutline, flowSvg, layoutFlow, outlineText } from './flow'
+import type { FlowMarks } from './flow'
+import { allDone, applyOp, compactLine, emptyMap, etaRange, etaText, exportMarkdown, findCycle, isActive, isStale, isStep, KINDS, mergeMaps, migrate, opSummary, planDiff, plainLines, readyIds, STATUSES, stageView, stats, textDiagram, timeline, validateMap } from './graph'
 import type { Op } from './graph'
 import { detectLang, HELP_TABS, LANGS, looksLikeRequest, resolveLang, STR } from './i18n'
 import type { Lang } from './i18n'
@@ -12,7 +13,7 @@ import { CAPSULE_CELLS, CAPSULE_CHROME, cells, fitCells, forkPrompt, languageRul
 import type { Suggestion, SuggestView } from './suggest'
 import { bandCards, barSegs, glyph, headerSegs } from './tui'
 import type { Seg } from './tui'
-import { amberPic, bandGraph, bandHeader, chevronPic, detailLines, fmtTime, iconPic, insHot, insMark, kindOf, metaOf, miniBar, paneBar, paneCards, paneStatus, PX_PER_COL, slotPic, STAR_W, starPic, THEMES } from './svg'
+import { amberPic, bandGraph, bandHeader, chevronPic, detailLines, fmtTime, iconPic, insFresh, insHot, insMark, kindOf, metaOf, miniBar, paneBar, paneCards, paneStatus, PX_PER_COL, slotPic, STAR_W, starPic, THEMES } from './svg'
 import type { Clock, Kind } from './svg'
 
 const TOOL = 'mcp__workflow-map__workflow_map'
@@ -82,6 +83,8 @@ const DEMO = atom({ plugin: 'workflow-map', key: 'demo' } as const, '' as '' | '
 const DIAGRAM = atom({ plugin: 'workflow-map', key: 'diagram' } as const, false)
 /** 全圖面板：正在看「插入前的計劃」的插入步驟 id（'' = 沒有） */
 const BEFORE = atom({ plugin: 'workflow-map', key: 'before' } as const, '')
+/** 全圖面板：正在看「插入後的改動」（現在的計劃 + 改動標記）的插入步驟 id（'' = 沒有） */
+const CHANGES = atom({ plugin: 'workflow-map', key: 'changes' } as const, '')
 /** 全圖面板「時間線」是否展開；最多列出最近 TIMELINE_MAX 項 */
 const TIMELINE_OPEN = atom({ plugin: 'workflow-map', key: 'timelineOpen' } as const, false)
 const TIMELINE_MAX = 40
@@ -138,6 +141,19 @@ const TICK = atom({ plugin: 'workflow-map', key: 'tick' } as const, 0)
 const WM_TAG = /\[wm:([^\]\s]+)\]/
 /** 本輪開始時間：本輪新插入的步驟在聚焦時一定顯示 */
 const TURN_AT = atom({ plugin: 'workflow-map', key: 'turnAt' } as const, 0)
+/** 用戶這次親手輸入、看似新要求的原文（等模型記入計劃） */
+const ASKED = atom({ plugin: 'workflow-map', key: 'asked' } as const, '')
+/** 一輪結束時仍未記入計劃的要求原文（'' = 沒有）：橫條標題行尾「未記錄：…［加入計劃］✕」，每則訊息一次 */
+const UNRECORDED = atom({ plugin: 'workflow-map', key: 'unrecorded' } as const, '')
+/** 一句話的開頭（最多 n 個字，多了加「…」），空白合併；拉丁字不在字中間切（退到最近的空格，最多退 10 個字） */
+const snippet = (s: string, n: number) => {
+  const c = [...s.replace(/\s+/g, ' ').trim()]
+  if (c.length <= n) return c.join('')
+  let head = c.slice(0, n).join('')
+  const sp = head.lastIndexOf(' ')
+  if (/[A-Za-z0-9]/.test(c[n]!) && /[A-Za-z0-9]$/.test(head) && sp >= 0 && n - sp <= 10) head = head.slice(0, sp)
+  return `${head.trimEnd()}…`
+}
 /** 聚焦的展開狀態在計劃改變、重開全圖時回到收起 */
 const foldAll = async ($: $) => {
   if (await read($, DONE_OPEN)) await update($, DONE_OPEN, () => false)
@@ -415,6 +431,7 @@ async function bindPlan($: $, planId: string) {
   undoFor = ''
   undoStack = []
   if (await read($, BEFORE)) await update($, BEFORE, () => '')
+  if (await read($, CHANGES)) await update($, CHANGES, () => '')
   const map = await loadMap($, planId).catch(() => emptyMap())
   await update($, MAP, () => map)
   await foldAll($)
@@ -667,9 +684,12 @@ export const register: Register = (on, options) => {
       await update($, LANG, () => detected)
       await $.store.set(LANG_KEY, detected)
     }
+    // 新訊息：上一則「未記錄」的提示收起（每則訊息只提示一次）
+    if (await read($, UNRECORDED)) await update($, UNRECORDED, () => '')
     // 「好」「ok」「繼續」、只有圖片、很短的訊息：不算新要求
     if (!isActive(await read($, MAP)) || !looksLikeRequest(e.text)) return next(e)
     await update($, PENDING, () => true)
+    await update($, ASKED, () => e.text)
     return next({ ...e, context: [...(e.context ?? []), HINT] })
   })
 
@@ -719,7 +739,12 @@ export const register: Register = (on, options) => {
       }
     }
     if (e.agentId === undefined) {
-      if (await read($, PENDING)) await update($, PENDING, () => false)
+      // 這一輪完了仍沒有任何工作流程操作：把那句要求留在橫條（未記錄：…［加入計劃］）
+      if (await read($, PENDING)) {
+        const asked = await read($, ASKED)
+        await update($, PENDING, () => false)
+        if (asked.trim()) await update($, UNRECORDED, () => asked)
+      }
       const done = allDone(await read($, MAP))
       await update($, DONE_TURNS, n => (done ? n + 1 : 0))
       // 做了不少工作仍未有計劃：橫條提示一行（每個 session 一次）
@@ -816,6 +841,7 @@ export const register: Register = (on, options) => {
     const t = STR[lang]
     const expanded = await read($, EXPANDED)
     const pending = await read($, PENDING)
+    const unrecorded = await read($, UNRECORDED)
     const table = $.ui.resolve(e)
     const { Box, Text, Button } = table
     const Svg = e.surface !== 'terminal' && 'Svg' in table ? table.Svg : undefined
@@ -827,6 +853,37 @@ export const register: Register = (on, options) => {
         <Button key="open" {...ICON_BTN} hotkey="f" label={t.openTip} onPress={() => openPane($, lang)} />
       </Box>
     )
+    // 未記錄的要求（一輪完了模型沒有記入）：「未記錄：開頭 16 字…」［加入計劃］✕ —— 加入計劃只把草稿放入輸入框，從不自動送出
+    const clearUnrecorded = () => update($, UNRECORDED, () => '')
+    const unrecordedRow = unrecorded
+      ? [
+          <Box key="unrec" flexShrink={1} minWidth={0} overflow="hidden">
+            <Text color="warning" wrap="truncate-end">
+              {t.unrecorded(snippet(unrecorded, 16))}
+            </Text>
+          </Box>,
+          <Box key="unrec-add" flexShrink={0}>
+            <Button
+              key="add-to-plan"
+              {...ICON_BTN}
+              hotkey="a"
+              label={t.addToPlan}
+              onPress={async () => {
+                await clearUnrecorded()
+                void $.prompt.fill({ text: t.addToPlanDraft(unrecorded) }).then(
+                  r => r.isFilled || $.ui.toast(t.fillFail),
+                  () => $.ui.toast(t.fillFail),
+                )
+              }}
+            />
+          </Box>,
+          <Box key="unrec-x" flexShrink={0}>
+            <Button key="unrecorded-dismiss" role="dismiss" hotkey="x" plain label="✕" onPress={clearUnrecorded} />
+          </Box>,
+        ]
+      : null
+    // 「未記錄」一組佔的格數（字 + 按鈕 + ✕ + 間距）：標題行左邊的「下一步」按這個讓位，不會被切走半個字
+    const unrecordedCells = unrecorded ? cells(t.unrecorded(snippet(unrecorded, 16))) + cells(t.addToPlan) + 2 + 3 * SPACE.GAP + 4 : 0
     // 終端機：一段段帶主題色的字排成一行（不換行）
     const segLine = (key: string, segs: readonly Seg[]) => (
       <Box key={key} flexDirection="row" flexShrink={0}>
@@ -896,9 +953,8 @@ export const register: Register = (on, options) => {
       const cols = Math.max(40, e.props.bodyColumns || 100)
       const view = stageView(map, { freshSince: await read($, TURN_AT) })
       const clock = await clockOf($)
-      const etaM = etaMin(map, clock.now)
       const ctlW = cells(expanded ? t.collapseTip : t.expandTip) + cells(t.openTip) + 3 * 2 + SPACE.GAP
-      const head = headerSegs(map, view, lang, clock, cols - ctlW - 2, pending, etaM === undefined ? '' : `≈ ${t.durShort(etaM)}`)
+      const head = headerSegs(map, view, lang, clock, cols - ctlW - 2 - unrecordedCells, pending, etaText(map, clock.now, lang, true))
       const g = expanded ? bandCards(map, view, lang, clock, cols - 1) : undefined
       planRows = [
         <Box key="title" flexDirection="row" alignItems="center">
@@ -908,6 +964,7 @@ export const register: Register = (on, options) => {
           <Box flexGrow={1} minWidth={2} />
           {segLine('meter', head.right)}
           <Box width={2} flexShrink={0} />
+          {unrecordedRow}
           {controls}
         </Box>,
         g ? (
@@ -919,10 +976,11 @@ export const register: Register = (on, options) => {
     } else if (showPlan && Svg) {
       const view = stageView(map, { freshSince: await read($, TURN_AT) })
       // 可用闊度：欄數 × 每格 px（寧小勿大），扣去兩個按鈕
-      const avail = Math.max(240, Math.round((e.props.bodyColumns || 100) * PX_PER_COL) - 56)
+      const avail = Math.max(240, Math.round((e.props.bodyColumns || 100) * PX_PER_COL) - 56 - Math.round(unrecordedCells * PX_PER_COL))
       const clock = await clockOf($)
-      const etaM = etaMin(map, clock.now)
-      const head = bandHeader(map, view, lang, T, avail, pending, clock, etaM === undefined ? '' : `≈ ${t.durShort(etaM)}`)
+      const eta = etaText(map, clock.now, lang, true)
+      const etaN = etaRange(map, clock.now)?.n ?? 0
+      const head = bandHeader(map, view, lang, T, avail, pending, clock, eta)
       const graph = expanded ? bandGraph(map, view, lang, T, avail + 56, clock) : undefined
       // 指著兩端小卡時的清單（無 hook：有 key 的 Box 是 hover 範圍，裏面藏一個沒有 key、display:none 的 Box，hover 時 display:flex）。
       // position:absolute、bottom={1}：向上開（下面是輸入框），底邊貼住小卡頂。清單是父 Box 的一部分：指標由小卡移到清單上仍然打開。
@@ -1014,11 +1072,12 @@ export const register: Register = (on, options) => {
           <Box flexShrink={0}>
             <Svg
               source={head.meter.source}
-              alt={[t.progressTip(s.done, s.total), etaM === undefined ? '' : t.etaTip(t.dur(etaM)), pending ? t.unloggedTip : ''].filter(Boolean).join('\n')}
+              alt={[t.progressTip(s.done, s.total), eta ? t.etaTip(eta, etaN) : '', pending ? t.unloggedTip : ''].filter(Boolean).join('\n')}
               width={head.meter.width}
               height={head.meter.height}
             />
           </Box>
+          {unrecordedRow}
           {controls}
         </Box>,
         graph ? (
@@ -1076,10 +1135,17 @@ export const register: Register = (on, options) => {
     const foreignEntry = foreign ? (await readProjects($)).find(p => p.root === foreign) : undefined
     const foreignMap = foreign ? await readForeign($, foreign, foreignEntry?.planId || LEGACY_ID) : undefined
     const current = foreign ? (foreignMap ?? emptyMap()) : await shownMap($)
-    // 插入前的計劃（唯讀）：檔案 SNAP_DIR/<planId>/<id>.json；示範時由示範資料拿走插入的步驟推算
+    // 一個中途要求的「插入前／插入後」（都是唯讀）：插入前 = 快照（SNAP_DIR/<planId>/<id>.json；示範時由示範資料拿走插入的步驟推算）；
+    // 插入後 = 現在的計劃，加上由快照到現在的改動標記（planDiff）
     const beforeId = foreign ? '' : await read($, BEFORE)
-    const beforeNode = beforeId ? current.nodes.find(n => n.id === beforeId) : undefined
-    const beforeMap = beforeId ? await snapshotOf($, current, beforeId) : undefined
+    const changesId = foreign || beforeId ? '' : await read($, CHANGES)
+    const reqId = beforeId || changesId
+    const beforeNode = reqId ? current.nodes.find(n => n.id === reqId) : undefined
+    const snap = reqId ? await snapshotOf($, current, reqId) : undefined
+    const beforeMap = beforeId ? snap : undefined
+    // 「階段 a → b」按畫面的編號：階段卡 = 未完成步驟按依賴分層；流程圖 = 組所在的行
+    const cardStages = (m: WorkflowMap) => new Map(stageView(m, { expandDone: true, expandFuture: true, smallPlan: Infinity }).levels.flatMap((lv, i) => lv.map(n => [n.id, i + 1] as const)))
+    const diff = changesId && snap ? planDiff(snap, current, cardStages) : undefined
     const map = beforeId ? (beforeMap ?? emptyMap()) : current
     const diagram = await read($, DIAGRAM)
     const projectName = (root: string) => root.split(/[\\/]/).filter(Boolean).pop() ?? root
@@ -1091,17 +1157,50 @@ export const register: Register = (on, options) => {
       </Box>
     ) : null
     const titlesOf = (ids: readonly string[]) => ids.map(id => current.nodes.find(n => n.id === id)?.title ?? id).join(t.list)
-    const beforeBanner = beforeId ? (
+    const leaveRequest = async () => {
+      await update($, BEFORE, () => '')
+      await update($, CHANGES, () => '')
+    }
+    // 頂部一行：返回 · 插入前 | 插入後（目前的一邊不淡）· 說明；插入後再加一行圖例
+    const beforeBanner = reqId ? (
       <Box key="before" flexDirection="column">
         <Box flexDirection="row" alignItems="center" gap={SPACE.GAP}>
-          <Button key="before-back" {...ICON_BTN} label={`← ${t.back}`} onPress={() => update($, BEFORE, () => '')} />
+          <Button key="before-back" {...ICON_BTN} label={`← ${t.back}`} onPress={leaveRequest} />
+          <Button
+            key="side-before"
+            plain
+            dimColor={!beforeId}
+            label={t.sideBefore}
+            onPress={async () => {
+              await update($, CHANGES, () => '')
+              await update($, BEFORE, () => reqId)
+            }}
+          />
+          <Text dimColor>|</Text>
+          <Button
+            key="side-after"
+            plain
+            dimColor={!changesId}
+            label={t.sideAfter}
+            onPress={async () => {
+              await update($, BEFORE, () => '')
+              await update($, CHANGES, () => reqId)
+            }}
+          />
           <Box flexShrink={1} minWidth={0} overflow="hidden">
             <Text dimColor wrap="truncate-end">
-              {t.beforeBanner(beforeNode?.title ?? beforeId)}
+              {beforeId ? t.beforeBanner(beforeNode?.title ?? reqId) : t.changesBanner(beforeNode?.title ?? reqId)}
             </Text>
           </Box>
         </Box>
-        {beforeNode?.impact
+        {diff ? (
+          <Box key="legend">
+            <Text dimColor wrap="truncate-end">
+              {t.diffLegend}
+            </Text>
+          </Box>
+        ) : null}
+        {beforeId && beforeNode?.impact
           ? [
               beforeNode.impact.added.length ? t.diffAdded(titlesOf(beforeNode.impact.added)) : '',
               beforeNode.impact.rewired.length ? t.diffRewired(titlesOf(beforeNode.impact.rewired)) : '',
@@ -1117,7 +1216,7 @@ export const register: Register = (on, options) => {
           : null}
       </Box>
     ) : null
-    if (beforeId && !beforeMap)
+    if (reqId && !snap)
       return (
         <Box flexDirection="column" paddingLeft={PANE_INSET} gap={SPACE.GAP}>
           {beforeBanner}
@@ -1139,7 +1238,7 @@ export const register: Register = (on, options) => {
         <Box flexDirection="column" paddingLeft={PANE_INSET} gap={SPACE.GAP}>
           {beforeBanner}
           <Text dimColor>{(await read($, BOUND)) ? t.empty : t.noPlanBound}</Text>
-          {beforeId ? null : (
+          {reqId ? null : (
             <Box flexDirection="row">
               <Button key="plans" {...ICON_BTN} label={t.plans} onPress={() => update($, PLANS_OPEN, () => true)} />
             </Box>
@@ -1148,7 +1247,8 @@ export const register: Register = (on, options) => {
       )
     }
     const doneOpen = await read($, DONE_OPEN)
-    const futureOpen = await read($, FUTURE_OPEN)
+    // 插入後的改動：稍後的步驟一併展開（受影響的步驟多在後面）
+    const futureOpen = (await read($, FUTURE_OPEN)) || !!diff
     const turnAt = await read($, TURN_AT)
     const pending = await read($, PENDING)
     const selected = await read($, SELECTED)
@@ -1162,7 +1262,7 @@ export const register: Register = (on, options) => {
     const doneShown = doneOpen || !base.foldDone
     // 工具列（標題行下一行，貼右）：匯出、歷史、說明
     const timelineOpen = await read($, TIMELINE_OPEN)
-    const readOnly = !!foreign || !!beforeId
+    const readOnly = !!foreign || !!reqId
     const tools = [
       { key: 'diagram', label: diagram ? t.stagesBtn : t.diagramBtn, onPress: () => update($, DIAGRAM, v => !v) },
       ...(readOnly ? [] : [{ key: 'timeline', label: timelineOpen ? t.hideTimeline : t.timelineBtn, onPress: () => update($, TIMELINE_OPEN, v => !v) }]),
@@ -1174,7 +1274,7 @@ export const register: Register = (on, options) => {
             { key: 'history', label: historyOpen ? t.hideHistory : t.history, onPress: () => update($, HISTORY_OPEN, v => !v) },
           ]),
       ...(readOnly ? [] : [{ key: 'plans', label: plansOpen ? t.hidePlans : t.plans, onPress: () => update($, PLANS_OPEN, v => !v) }]),
-      ...(beforeId ? [] : [{ key: 'projects', label: projectsOpen ? t.hideProjects : t.projects, onPress: () => update($, PROJECTS_OPEN, v => !v) }]),
+      ...(reqId ? [] : [{ key: 'projects', label: projectsOpen ? t.hideProjects : t.projects, onPress: () => update($, PROJECTS_OPEN, v => !v) }]),
     ]
     const plans = plansOpen && !foreign ? await listPlans($) : []
     const mySession = await sessionIdOf($)
@@ -1212,10 +1312,10 @@ export const register: Register = (on, options) => {
         <Markdown key={key} text="---" />
       ) : null
     // 圖示欄：桌面 20px 圖，終端機 1 個字；沒有圖示時是同闊的空位
-    const iconCol = (k: Kind | undefined, ins: boolean, alt: string) =>
+    const iconCol = (k: Kind | undefined, ins: boolean, alt: string, fresh = false) =>
       Svg ? (
         k ? (
-          <Svg source={iconPic(k, ins, T).source} alt={alt} width={ICON_COL} height={ICON_COL} />
+          <Svg source={iconPic(k, ins, T, fresh).source} alt={alt} width={ICON_COL} height={ICON_COL} />
         ) : (
           <Svg source={slot!.source} alt="" width={ICON_COL} height={ICON_COL} />
         )
@@ -1269,7 +1369,8 @@ export const register: Register = (on, options) => {
       cols - rowChrome - (r.info ? cells(r.info) + SPACE.GAP : 0) - (r.status ? cells(r.status) + SPACE.GAP : 0) - (cells(detail) + 2)
     // 打開了詳情的插入步驟：它的影響（之後要等它的步驟）在階段卡用紫點、在流程圖用紫框標出
     const selNode = map.nodes.find(n => n.id === selected)
-    const impactIds = new Set(selNode?.impact ? [...selNode.impact.rewired, ...selNode.impact.downstream] : [])
+    // 插入後的改動畫面已有自己的標記：不再疊紫點
+    const impactIds = new Set(selNode?.impact && !diff ? [...selNode.impact.rewired, ...selNode.impact.downstream] : [])
     const violet = Svg ? T.ins : 'merged'
     // 詳情的行（插入的步驟另有「插入前的計劃」按鈕；唯讀檢視時沒有）
     const hasBefore = !readOnly && selNode?.inserted ? (await snapshotOf($, map, selNode.id, true)) !== undefined : false
@@ -1283,8 +1384,34 @@ export const register: Register = (on, options) => {
           </Text>,
         ),
       ),
-      n.inserted && hasBefore ? line('before-btn', iconCol(undefined, false, ''), btn(`before:${n.id}`, t.beforeBtn, () => update($, BEFORE, () => n.id))) : null,
+      n.inserted && hasBefore
+        ? line(
+            'before-btn',
+            iconCol(undefined, false, ''),
+            btn(`changes:${n.id}`, t.changesBtn, async () => {
+              // 進入改動畫面時收起詳情（畫面上的標記已說明）
+              await update($, SELECTED, () => '')
+              await update($, CHANGES, () => n.id)
+            }),
+            btn(`before:${n.id}`, t.beforeBtn, () => update($, BEFORE, () => n.id)),
+          )
+        : null,
     ]
+    // 插入後的改動標記（階段卡）：標題前 + ／ ~；標題後「階段 3 → 4」、● 因此要等；~ 的步驟下面一行「改為等 ◇X」
+    const dAdded = new Set(diff?.added ?? [])
+    const dRewired = new Map((diff?.rewired ?? []).map(r => [r.id, r.via]))
+    const dMoved = new Map((diff?.moved ?? []).map(m => [m.id, m]))
+    const dBlocked = new Set(diff?.blocked ?? [])
+    const titleOf = (id: string) => map.nodes.find(n => n.id === id)?.title ?? id
+    const marks: FlowMarks | undefined = diff
+      ? {
+          added: dAdded,
+          rewired: new Set(dRewired.keys()),
+          moved: new Map(planDiff(snap!, current, diagramStages).moved.map(m => [m.id, `${m.from}→${m.to}`])),
+          blocked: dBlocked,
+          removed: diff.removed.map(r => r.title),
+        }
+      : undefined
     // 一張階段卡：卡頭（已完成段不用，段標題已說了）＋ 各步，步與步之間 app 的分隔線
     const stageCard = (c: (typeof cards)[number], bare: boolean) =>
       card(c.key, [
@@ -1299,8 +1426,9 @@ export const register: Register = (on, options) => {
             <Box key={`row:${r.n.id}`} flexDirection="column">
               {line(
                 'main',
-                iconCol(r.k, r.ins, r.status || t.status[r.n.status]),
+                iconCol(r.k, r.ins, r.status || t.status[r.n.status], r.fresh),
                 r.mark ? fixed('ins-mark', '◇', undefined, true) : null,
+                dAdded.has(r.n.id) ? fixed('diff-add', '+', Svg ? T.done : 'success') : dRewired.has(r.n.id) ? fixed('diff-rewired', '~', violet) : null,
                 shrink(
                   'title',
                   <Text wrap="truncate-end" dimColor={r.k === 'todo'}>
@@ -1308,6 +1436,8 @@ export const register: Register = (on, options) => {
                   </Text>,
                 ),
                 impactIds.has(r.n.id) ? fixed('impact', '•', violet) : null,
+                dMoved.has(r.n.id) ? fixed('diff-moved', `${t.stage(dMoved.get(r.n.id)!.from, 1)} → ${dMoved.get(r.n.id)!.to}`, undefined, true) : null,
+                dBlocked.has(r.n.id) ? fixed('diff-blocked', '●', 'warning') : null,
                 <Box flexGrow={1} />,
                 ...(wide ? metaParts : []),
                 <Box key="detail-btn" flexShrink={0}>
@@ -1323,6 +1453,18 @@ export const register: Register = (on, options) => {
                       'sub-t',
                       <Text dimColor={!r.ins} color={r.ins ? violet : undefined} wrap="truncate-end">
                         {r.sub}
+                      </Text>,
+                    ),
+                  )
+                : null}
+              {dRewired.has(r.n.id)
+                ? line(
+                    'diff-sub',
+                    iconCol(undefined, false, ''),
+                    shrink(
+                      'diff-sub-t',
+                      <Text color={violet} wrap="truncate-end">
+                        {t.nowWaitsFor(dRewired.get(r.n.id)!.map(titleOf).join(t.list))}
                       </Text>,
                     ),
                   )
@@ -1360,13 +1502,14 @@ export const register: Register = (on, options) => {
           ]
         : []),
     ]
-    const paneEta = etaMin(map, clock.now)
+    const paneEta = etaText(map, clock.now, lang)
+    const paneEtaN = etaRange(map, clock.now)?.n ?? 0
     // 流程圖：桌面一張圖（闊 = 面板格數 × 每格 px，1:1）；終端機是按組的縮排大綱
     const outline = diagram ? flowOutline(map, lang, Math.max(20, cols - PANE_INSET - 1), clock) : []
     let diagramPic: { source: string; width: number; height: number } | undefined
     if (diagram && Svg) {
       const lay = layoutFlow(map, { width: Math.max(240, Math.round(cols * PX_PER_COL) - 16), lang })
-      diagramPic = flowSvg(map, lay, lang, T, clock, impactIds)
+      diagramPic = flowSvg(map, lay, lang, T, clock, marks ? new Set() : impactIds, marks)
       // Svg 的內容上限 131072 字（約 250 步以上才會超過）：超過就改用文字大綱
       if (diagramPic.source.length > 131072) diagramPic = undefined
     }
@@ -1393,7 +1536,7 @@ export const register: Register = (on, options) => {
                   <Box key={`req:${n.id}`} flexDirection="column">
                     {line(
                       'main',
-                      iconCol(kindOf(n, readyIds(map.nodes), clock), insHot(n, clock), t.status[n.status]),
+                      iconCol(kindOf(n, readyIds(map.nodes), clock), insHot(n, clock), t.status[n.status], insFresh(n, clock)),
                       insMark(n, clock) ? fixed('ins-mark', '◇', undefined, true) : null,
                       shrink('title', <Text wrap="truncate-end">{n.title}</Text>),
                       <Box flexGrow={1} />,
@@ -1469,7 +1612,7 @@ export const register: Register = (on, options) => {
           {/* 進度條在可縮的格內（preserveAspectRatio none）：窄時縮條，不縮數字 */}
           <Box flexGrow={Svg ? 1 : 0} flexShrink={1} overflow="hidden">
             {Svg ? (
-              <Svg source={paneBar(map, T, 360).source} alt={t.progressTip(s.done, s.total)} height={20} />
+              <Svg source={paneBar(map, T, 360).source} alt={[t.progressTip(s.done, s.total), paneEta ? t.etaTip(paneEta, paneEtaN) : ''].filter(Boolean).join('\n')} height={20} />
             ) : (
               // 終端機：字元進度條闊 = 這一行餘下的格數（數字、時間、狀態字之後），不會換行
               segLine(
@@ -1482,7 +1625,7 @@ export const register: Register = (on, options) => {
                       PANE_INSET -
                       3 -
                       cells(`${s.done} / ${s.total}`) -
-                      (paneEta === undefined ? 0 : 1 + cells(`≈ ${t.dur(paneEta)}`)) -
+                      (paneEta ? 1 + cells(paneEta) : 0) -
                       (pending ? 2 : 0) -
                       (cols >= 70 && status ? 1 + cells(status) : 0),
                   ),
@@ -1494,11 +1637,11 @@ export const register: Register = (on, options) => {
           <Box flexShrink={0}>
             <Text bold>{`${s.done} / ${s.total}`}</Text>
           </Box>
-          {paneEta === undefined ? null : (
+          {paneEta ? (
             <Box flexShrink={0}>
-              <Text dimColor>{`≈ ${t.dur(paneEta)}`}</Text>
+              <Text dimColor>{paneEta}</Text>
             </Box>
-          )}
+          ) : null}
           {pending ? <Text color="warning">●</Text> : null}
           {/* 窄面板先不顯示狀態字 */}
           {cols >= 70 && status ? (
@@ -1634,7 +1777,25 @@ export const register: Register = (on, options) => {
               ]),
             ])
           : null}
-        {projectsOpen && !beforeId
+        {/* 插入後：已移除的步驟（刪除線）；流程圖已在圖的最底一行畫了 */}
+        {diff?.removed.length && !diagram
+          ? card('removed', [
+              line('head', iconCol(undefined, false, ''), <Text bold>{t.removedTitle}</Text>),
+              ...diff.removed.map((r, i) =>
+                line(
+                  `rm${i}`,
+                  iconCol(undefined, false, ''),
+                  shrink(
+                    'rm-t',
+                    <Text dimColor strikethrough wrap="truncate-end">
+                      {r.title}
+                    </Text>,
+                  ),
+                ),
+              ),
+            ])
+          : null}
+        {projectsOpen && !reqId
           ? card('projects', [
               line('head', iconCol(undefined, false, ''), <Text bold>{t.projects}</Text>),
               projects.length === 0 ? line('empty', iconCol(undefined, false, ''), <Text dimColor>{t.projectsEmpty}</Text>) : null,
@@ -1925,6 +2086,11 @@ async function serveTool($: $, e: Record<string, unknown>): Promise<{ deny: stri
   const r = await applyAndWrite($, args as unknown as Op)
   if ('error' in r) return { deny: r.error }
   if (await read($, PENDING)) await update($, PENDING, () => false)
+  // 模型把用戶的要求記入了：短通知「已記錄：用戶原話」（通知關了就不彈）；上一則「未記錄」提示亦收起
+  if (args.op === 'insert') {
+    if (await read($, UNRECORDED)) await update($, UNRECORDED, () => '')
+    if (notifyOn && typeof args.note === 'string' && args.note.trim()) $.ui.toast(STR[await langNow($)].recorded(snippet(args.note, 24)))
+  }
   return { result: r.text }
 }
 

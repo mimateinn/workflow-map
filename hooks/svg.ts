@@ -35,7 +35,7 @@ export const THEMES: Record<'dark' | 'light', Theme> = {
 export const PX_PER_COL = 6.4
 
 const FONT = "system-ui,-apple-system,'Segoe UI','Microsoft JhengHei','PingFang TC','Noto Sans CJK TC',sans-serif"
-const css = (T: Theme, motion = true) =>
+const css = (T: Theme, motion = true, fresh = false) =>
   '<style>' +
   `text{font-family:${FONT};font-size:12px;fill:${T.text};font-variant-numeric:tabular-nums}` +
   `.m{font-size:11px;fill:${T.dim}}.d{fill:${T.dim}}.b{font-weight:600}.r{fill:${T.run}}.a{fill:${T.block}}` +
@@ -45,13 +45,19 @@ const css = (T: Theme, motion = true) =>
       '.p{transform-box:fill-box;transform-origin:center;animation:wmp 1.8s ease-out infinite}' +
       '@media (prefers-reduced-motion:reduce){.p{animation:none;opacity:0}}'
     : '') +
+  // 本輪剛記錄的中途要求：紫色菱形外圈擴散三次（「已記入」的確認），之後靜止
+  (fresh
+    ? '@keyframes wmq{0%{opacity:.9;transform:scale(1)}80%,100%{opacity:0;transform:scale(2)}}' +
+      '.q{transform-box:fill-box;transform-origin:center;opacity:0;animation:wmq 1.4s ease-out 3}' +
+      '@media (prefers-reduced-motion:reduce){.q{animation:none}}'
+    : '') +
   '</style>'
 
 export type Pic = { source: string; width: number; height: number }
 export const doc = (w: number, h: number, T: Theme, body: string): Pic => {
   const width = Math.max(1, Math.ceil(w))
   const height = Math.max(1, Math.ceil(h))
-  return { source: `<svg xmlns='http://www.w3.org/2000/svg' width='${width}' height='${height}' viewBox='0 0 ${width} ${height}'>${css(T, body.includes("class='p'"))}${body}</svg>`, width, height }
+  return { source: `<svg xmlns='http://www.w3.org/2000/svg' width='${width}' height='${height}' viewBox='0 0 ${width} ${height}'>${css(T, body.includes("class='p'"), body.includes("class='q'"))}${body}</svg>`, width, height }
 }
 
 export const esc = (s: string) => s.replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`)
@@ -95,6 +101,9 @@ export type Clock = { now: number; staleMin: number; turnAt?: number }
 
 /** 紫色 ◇（本輪插入或本輪完成的插入步驟） */
 export const insHot = (n: WorkflowNode, c: Clock) => insertedHot(n, c.turnAt)
+/** 本輪剛插入、仍未完成的步驟：圖示外圈擴散三次（記錄了的確認） */
+export const insFresh = (n: WorkflowNode, c: Clock) =>
+  !!n.inserted && !!c.turnAt && (Date.parse(n.inserted.at) || 0) >= c.turnAt && n.status !== 'done' && n.status !== 'dropped'
 /** 標題前的淡色 ◇（舊輪插入、仍未完成） */
 export const insMark = (n: WorkflowNode, c: Clock) => insertedMarked(n, c.turnAt)
 /** 標題前加淡色記號的寬度（px，12px 字） */
@@ -121,7 +130,11 @@ export function metaOf(n: WorkflowNode, lang: Lang, c: Clock): string {
  * 狀態圖示（12px，中心 cx, cy）：✓ 實心圓、進行中 擴散圓環、未開始 空心圓、受阻 琥珀「!」。
  * 用戶插入的步驟改用菱形（形狀不同，不只靠顏色）。
  */
-export function icon(k: Kind, ins: boolean, cx: number, cy: number, T: Theme): string {
+export function icon(k: Kind, ins: boolean, cx: number, cy: number, T: Theme, fresh = false): string {
+  if (fresh) {
+    const d = `M${r1(cx)},${r1(cy - 6.2)} L${r1(cx + 6.2)},${r1(cy)} L${r1(cx)},${r1(cy + 6.2)} L${r1(cx - 6.2)},${r1(cy)} Z`
+    return `<path class='q' d='${d}' fill='none' stroke='${T.ins}' stroke-width='1.5' stroke-linejoin='round'/>${icon(k, ins, cx, cy, T)}`
+  }
   const f = (n: number) => r1(n)
   const check = `<path d='M${f(cx - 2.7)},${f(cy + 0.2)} L${f(cx - 0.8)},${f(cy + 2.1)} L${f(cx + 2.8)},${f(cy - 2)}' stroke='#ffffff' stroke-width='1.6' fill='none' stroke-linecap='round' stroke-linejoin='round'/>`
   const bang = (c: string) => `<path d='M${f(cx)},${f(cy - 3)} V${f(cy + 0.7)} M${f(cx)},${f(cy + 2.9)} V${f(cy + 3)}' stroke='${c}' stroke-width='1.7' stroke-linecap='round'/>`
@@ -278,7 +291,7 @@ export function bandHeader(map: WorkflowMap, view: StageView, lang: Lang, T: The
 
 // ---------------- 展開：GitHub Actions 式卡片 ----------------
 
-type CardRow = { k?: Kind; ins?: boolean; mark?: boolean; label: string; cls?: string; meta?: string }
+type CardRow = { k?: Kind; ins?: boolean; fresh?: boolean; mark?: boolean; label: string; cls?: string; meta?: string }
 type Card = { rows: CardRow[]; w: number; hot: boolean }
 
 const CARD_ROW = 18
@@ -330,7 +343,7 @@ export function bandGraph(map: WorkflowMap, view: StageView, lang: Lang, T: Them
     )
     c.rows.forEach((r, j) => {
       const cy = 0.5 + 1 + j * CARD_ROW + CARD_ROW / 2
-      if (r.k) parts.push(icon(r.k, !!r.ins, x + ICON_X, cy, T))
+      if (r.k) parts.push(icon(r.k, !!r.ins, x + ICON_X, cy, T, !!r.fresh))
       // textLength 只在後面還有字時才用（否則估算誤差會把字距拉開）
       const lx = x + (r.k ? LABEL_X : 10) + (r.mark ? MARK_W : 0)
       if (r.mark) parts.push(text(lx - MARK_W, cy + 4, '◇', 'm'))
@@ -345,7 +358,7 @@ export function bandGraph(map: WorkflowMap, view: StageView, lang: Lang, T: Them
   // 中間各層的卡：放得下多少就畫多少（左右兩張小卡的位先留起）
   const levelCards = view.levels.map(lv => {
     const shown = lv.length > 3 ? lv.slice(0, 2) : lv
-    const cr: CardRow[] = shown.map(n => ({ k: kindOf(n, ready, clk), ins: insHot(n, clk), mark: insMark(n, clk), label: n.title, meta: metaOf(n, lang, clk) }))
+    const cr: CardRow[] = shown.map(n => ({ k: kindOf(n, ready, clk), ins: insHot(n, clk), fresh: insFresh(n, clk), mark: insMark(n, clk), label: n.title, meta: metaOf(n, lang, clk) }))
     if (lv.length > 3) cr.push({ label: t.moreRows(lv.length - 2), cls: 'd' })
     return { c: card(cr, lv.some(n => n.status === 'doing')), steps: lv }
   })
@@ -423,8 +436,8 @@ export function paneBar(map: WorkflowMap, T: Theme, width: number): Pic {
 }
 
 /** 一個狀態圖示（20×20，留位給呼吸圓環）。 */
-export function iconPic(k: Kind, ins: boolean, T: Theme): Pic {
-  return doc(20, 20, T, icon(k, ins, 10, 10, T))
+export function iconPic(k: Kind, ins: boolean, T: Theme, fresh = false): Pic {
+  return doc(20, 20, T, icon(k, ins, 10, 10, T, fresh))
 }
 
 /** 專案總覽的小進度條（60×20）。 */
@@ -468,6 +481,8 @@ export type PaneRow = {
   k: Kind
   /** 紫色 ◇（本輪插入／完成）；mark = 舊輪插入、未完成：一般樣式 + 標題前淡色 ◇ */
   ins: boolean
+  /** 本輪剛記錄（圖示外圈擴散三次） */
+  fresh: boolean
   mark: boolean
   /** 右邊的狀態字與顏色（主題色名稱）；空 = 不顯示 */
   status: string
@@ -496,7 +511,7 @@ export function paneCards(map: WorkflowMap, view: StageView, o: { lang: Lang; do
       .join(' · ')
     const status = k === 'doing' ? t.status.doing : k === 'stale' ? t.stale : k === 'blocked' ? t.status.blocked : k === 'ready' ? t.ready : ''
     const statusColor = k === 'doing' ? 'claude' : k === 'blocked' || k === 'stale' ? 'warning' : undefined
-    return { n, k, ins: insHot(n, c), mark: insMark(n, c), status, statusColor, info: metaOf(n, o.lang, c), sub }
+    return { n, k, ins: insHot(n, c), fresh: insFresh(n, c), mark: insMark(n, c), status, statusColor, info: metaOf(n, o.lang, c), sub }
   }
   const cards: PaneCard[] = []
   if (view.done.length) {

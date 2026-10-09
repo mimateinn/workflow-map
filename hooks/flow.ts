@@ -9,7 +9,7 @@ import { isStep, readyIds } from './graph'
 import { STR } from './i18n'
 import type { Lang } from './i18n'
 import { cells, fitCells } from './suggest'
-import { doc, fit, icon, insHot, insMark, kindOf, text, tw } from './svg'
+import { doc, fit, icon, insFresh, insHot, insMark, kindOf, text, tw } from './svg'
 import type { Clock, Pic, Theme } from './svg'
 import { glyph } from './tui'
 import type { Seg } from './tui'
@@ -194,6 +194,14 @@ export function flowStructure(map: WorkflowMap): FlowStructure {
   sweep(up, succs)
   sweep(down, preds)
   return { units, layers, edges }
+}
+
+/** 流程圖上每一步在第幾個階段（它的組／單位所在的層 + 1），給改動標記的「3→4」用，與左邊的「階段 n」一致 */
+export function diagramStages(map: WorkflowMap): Map<string, number> {
+  const st = flowStructure(map)
+  const out = new Map<string, number>()
+  st.layers.forEach((l, i) => l.forEach(uid => st.units.find(u => u.id === uid)!.members.forEach(m => out.set(m.id, i + 1))))
+  return out
 }
 
 /**
@@ -396,7 +404,16 @@ const waitsText = (t: (typeof STR)[Lang], names: readonly string[]) => `← ${t.
  * 畫成一張 SVG（圖片模式、透明底）。顏色跟其他介面：進行中 = 強調色、完成 = 綠、受阻 = 琥珀、未開始 = 中性；
  * 本輪插入／完成的插入步驟用紫色 ◇，舊輪插入未完成的標題前淡色 ◇。highlight = 要加紫色外框的步驟（插入的影響）。
  */
-export function flowSvg(map: WorkflowMap, lay: FlowLayout, lang: Lang, T: Theme, clk: Clock, highlight: ReadonlySet<string> = new Set()): Pic {
+/** 流程圖上的改動標記（插入後）：+ 新增（綠框）、~ 改為等它（紫框）、移後的階段「3→4」、● 因此要等、已移除的（刪除線，畫在最底一行） */
+export type FlowMarks = {
+  added: ReadonlySet<string>
+  rewired: ReadonlySet<string>
+  moved: ReadonlyMap<string, string>
+  blocked: ReadonlySet<string>
+  removed: readonly string[]
+}
+
+export function flowSvg(map: WorkflowMap, lay: FlowLayout, lang: Lang, T: Theme, clk: Clock, highlight: ReadonlySet<string> = new Set(), marks?: FlowMarks): Pic {
   const t = STR[lang]
   const ready = readyIds(map.nodes)
   const byId = new Map(map.nodes.map(n => [n.id, n]))
@@ -460,16 +477,63 @@ export function flowSvg(map: WorkflowMap, lay: FlowLayout, lang: Lang, T: Theme,
         fk === 'decision'
           ? `<rect x='${c.x + 0.75}' y='${c.y + 0.75}' width='${c.w - 1.5}' height='${c.h - 1.5}' rx='6' ${tint} stroke='${T.ink}' stroke-opacity='.5' stroke-width='1.5' stroke-dasharray='4 3'/>`
           : `<rect x='${c.x}' y='${c.y}' width='${c.w}' height='${c.h}' rx='6' ${tint}/>`,
-        icon(k, insHot(n, clk), c.x + 11, cy, T),
+        icon(k, insHot(n, clk), c.x + 11, cy, T, insFresh(n, clk)),
       )
       // 舊輪插入、仍未完成：標題前一個淡色 ◇
       const mark = insMark(n, clk) ? MARK_W : 0
       if (mark) out.push(text(c.x + 24, cy + 4, '◇', 'm'))
       out.push(text(c.x + 24 + mark, cy + 4, fit(n.title, 12, c.w - CHROME - mark), k === 'todo' ? 'd' : ''))
       if (highlight.has(c.id)) out.push(`<rect x='${c.x - 2}' y='${c.y - 2}' width='${c.w + 4}' height='${c.h + 4}' rx='8' fill='none' stroke='${T.ins}' stroke-width='1.5'/>`)
+      if (marks) out.push(markCell(c, marks, T))
     }
   }
-  return doc(lay.width, lay.height, T, out.join(''))
+  // 已移除的步驟：最底一行，虛線框 + 刪除線
+  let height = lay.height
+  if (marks?.removed.length) {
+    const label = STR[lang].removedTitle
+    let x = lay.gut
+    let y = lay.height + 8
+    out.push(text(MARGIN, y + 16, fit(label, 11, lay.gut - 8), 'm'))
+    for (const title of marks.removed) {
+      const s = fit(title, 12, lay.width - lay.gut - 24)
+      const w = tw(s) + 20
+      if (x > lay.gut && x + w > lay.width - MARGIN) {
+        x = lay.gut
+        y += 30
+      }
+      out.push(
+        `<rect x='${x + 0.5}' y='${y + 0.5}' width='${w - 1}' height='23' rx='6' fill='none' stroke='${T.ink}' stroke-opacity='.35' stroke-dasharray='3 2'/>`,
+        text(x + 10, y + 16, s, 'd', { fixed: true }),
+        `<path d='M${x + 8},${y + 12} H${x + w - 8}' stroke='${T.dim}' stroke-width='1'/>`,
+      )
+      x += w + 8
+    }
+    height = y + 24 + MARGIN
+  }
+  return doc(lay.width, height, T, out.join(''))
+}
+
+/** 一格的改動標記：外框（新增 = 綠、改為等它 = 紫）＋ 右上角的小記號（+、~、3→4、●），由右向左排 */
+function markCell(c: FlowCell, m: FlowMarks, T: Theme): string {
+  const out: string[] = []
+  const ring = m.added.has(c.id) ? T.done : m.rewired.has(c.id) ? T.ins : ''
+  if (ring) out.push(`<rect x='${c.x - 2}' y='${c.y - 2}' width='${c.w + 4}' height='${c.h + 4}' rx='8' fill='none' stroke='${ring}' stroke-width='1.5'/>`)
+  let right = c.x + c.w + 2
+  const top = c.y - 2
+  const chip = (w: number, body: (x: number) => string) => {
+    out.push(body(right - w))
+    right -= w + 3
+  }
+  if (m.added.has(c.id))
+    chip(14, x => `<circle cx='${x + 7}' cy='${top}' r='7' fill='${T.done}'/><path d='M${x + 4},${top} H${x + 10} M${x + 7},${top - 3} V${top + 3}' stroke='#ffffff' stroke-width='1.6' stroke-linecap='round'/>`)
+  if (m.rewired.has(c.id)) chip(14, x => `<circle cx='${x + 7}' cy='${top}' r='7' fill='${T.ins}'/><text x='${x + 7}' y='${top + 4}' text-anchor='middle' style='font-size:11px;fill:#ffffff;font-weight:600'>~</text>`)
+  const mv = m.moved.get(c.id)
+  if (mv) {
+    const w = tw(mv, 10) + 10
+    chip(w, x => `<rect x='${x}' y='${top - 7}' width='${w}' height='14' rx='7' fill='${T.block}'/><text x='${x + w / 2}' y='${top + 3.5}' text-anchor='middle' style='font-size:10px;fill:#1f1f1f;font-weight:600'>${mv}</text>`)
+  }
+  if (m.blocked.has(c.id)) chip(8, x => `<circle cx='${x + 4}' cy='${top}' r='4' fill='${T.block}'/>`)
+  return out.join('')
 }
 
 /** 一行字段截到 cols 格以內（最後一段加「…」） */
